@@ -1,0 +1,29 @@
+# 环境变量（含私钥，绝对不上传）
+.env
+
+# 数据库和运行时数据
+*.db
+*.db-shm
+*.db-wal
+data/
+logs/
+
+# 大型数据文件
+btc_1m_7d.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# macOS
+.DS_Store
