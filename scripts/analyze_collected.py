@@ -16,7 +16,8 @@ from pathlib import Path
 
 # ────────────────────────────────────────────
 _root = Path(__file__).parent.parent
-_DEFAULT_DB = _root / "data" / "observations.db"
+# collect_data.py 默认在项目根目录创建 observations.db
+_DEFAULT_DB = _root / "observations.db"
 
 
 def load_obs(db_path: str) -> list[dict]:
@@ -40,6 +41,17 @@ def load_trades(db_path: str) -> list[dict]:
         conn.close()
 
 
+def _best_gap(r: dict) -> float | None:
+    """
+    选取最可靠的 gap 值（与 collect_data.py 优先级一致）：
+    Chainlink 链上 > CryptoCompare(gap_pct) > Binance(bn_gap_pct)
+    """
+    cl = r.get("cl_onchain_gap_pct")
+    if cl is not None:
+        return cl
+    return r.get("gap_pct")
+
+
 def analyze(obs: list[dict]) -> None:
     if not obs:
         print("没有数据，请先运行 scripts/collect_data.py 采集数据。")
@@ -53,7 +65,23 @@ def analyze(obs: list[dict]) -> None:
     first_ts = obs[0]["ts"]
     last_ts  = obs[-1]["ts"]
     hours = (last_ts - first_ts) / 3600
-    print(f"覆盖时间: {hours:.1f} 小时 / 约 {hours/24:.1f} 天\n")
+    print(f"覆盖时间: {hours:.1f} 小时 / 约 {hours/24:.1f} 天")
+
+    # Chainlink 链上数据覆盖率统计
+    cl_count = sum(1 for r in obs if r.get("cl_onchain_gap_pct") is not None)
+    print(f"Chainlink链上gap 覆盖率: {cl_count}/{total} ({cl_count/total:.0%})")
+
+    # CL vs CC 偏差统计（有助于评估 gap 精度）
+    both = [
+        r for r in obs
+        if r.get("cl_onchain_gap_pct") is not None and r.get("gap_pct") is not None
+    ]
+    if both:
+        diffs = [abs(r["cl_onchain_gap_pct"] - r["gap_pct"]) for r in both]
+        avg_diff = sum(diffs) / len(diffs)
+        print(f"CL链上 vs CC 平均gap偏差: {avg_diff:.4f}%  "
+              f"(偏差>0.05%的比例: {sum(1 for d in diffs if d > 0.05)/len(diffs):.0%})")
+    print()
 
     # ── 核心分析：入场窗口内（第3~4分钟）的市场定价 ──
     print("── 末期套利机会分析（入场窗口：3:30~4:30） ──\n")
@@ -63,23 +91,24 @@ def analyze(obs: list[dict]) -> None:
         theo_wr_map = {0.05: 0.897, 0.10: 0.968, 0.15: 0.979, 0.20: 0.982}
         theo_wr = theo_wr_map[gap_threshold]
 
-        # 筛选：入场窗口内 + gap 满足阈值
+        # 筛选：入场窗口内 + 最佳gap满足阈值
         matching = [
             r for r in obs
             if r["minute_in_window"] in (3, 4)
-            and r["gap_pct"] is not None
-            and abs(r["gap_pct"]) >= gap_threshold
+            and _best_gap(r) is not None
+            and abs(_best_gap(r)) >= gap_threshold
         ]
         if len(matching) < 5:
             continue
 
+        # 标注 CL 数据占比
+        cl_in_match = sum(1 for r in matching if r.get("cl_onchain_gap_pct") is not None)
+
         # 获取对应方向的市场赔率
         market_prices = []
         for r in matching:
-            if r["gap_pct"] > 0:  # Up 方向
-                mp = r["up_odds"]
-            else:  # Down 方向
-                mp = r["down_odds"]
+            g = _best_gap(r)
+            mp = r["up_odds"] if g > 0 else r["down_odds"]
             if mp and 0 < mp < 1:
                 market_prices.append(mp)
 
@@ -93,15 +122,14 @@ def analyze(obs: list[dict]) -> None:
         p25    = market_prices[n // 4]
         p75    = market_prices[3 * n // 4]
 
-        # EV 计算（基于中位数入场价）
         ev_median = theo_wr * (1 - median) - (1 - theo_wr) * median
         ev_avg    = theo_wr * (1 - avg)    - (1 - theo_wr) * avg
 
-        # 可盈利比例：市场赔率 < 理论胜率
         profitable = sum(1 for mp in market_prices if mp < theo_wr)
         profitable_pct = profitable / n
 
-        print(f"  gap ≥ {gap_threshold:.2f}% | 理论胜率={theo_wr:.1%}")
+        print(f"  gap ≥ {gap_threshold:.2f}% | 理论胜率={theo_wr:.1%}  "
+              f"[CL链上占比: {cl_in_match}/{n}]")
         print(f"  样本={n}  市场价格: 中位={median:.3f}  均值={avg:.3f}  "
               f"Q25={p25:.3f}  Q75={p75:.3f}")
         print(f"  EV(中位)={ev_median:+.4f}  EV(均值)={ev_avg:+.4f}  "
@@ -121,12 +149,10 @@ def analyze(obs: list[dict]) -> None:
     print("── 各时段（UTC）套利机会分布 ──\n")
     hour_data: dict[int, list[float]] = {}
     for r in obs:
-        if r["minute_in_window"] in (3, 4) and r["gap_pct"] and abs(r["gap_pct"]) >= 0.10:
+        g = _best_gap(r)
+        if r["minute_in_window"] in (3, 4) and g and abs(g) >= 0.10:
             hour = (r["ts"] % 86400) // 3600
-            if r["gap_pct"] > 0:
-                mp = r["up_odds"]
-            else:
-                mp = r["down_odds"]
+            mp = r["up_odds"] if g > 0 else r["down_odds"]
             if mp and 0 < mp < 1:
                 hour_data.setdefault(hour, []).append(mp)
 
@@ -151,11 +177,11 @@ def analyze(obs: list[dict]) -> None:
     print(f"{'='*60}")
 
     all_gap10 = [
-        r["up_odds"] if r["gap_pct"] > 0 else r["down_odds"]
+        r["up_odds"] if _best_gap(r) > 0 else r["down_odds"]
         for r in obs
         if r["minute_in_window"] in (3, 4)
-        and r["gap_pct"] and abs(r["gap_pct"]) >= 0.10
-        and 0 < (r["up_odds"] if r["gap_pct"] > 0 else r["down_odds"]) < 1
+        and _best_gap(r) is not None and abs(_best_gap(r)) >= 0.10
+        and 0 < (r["up_odds"] if _best_gap(r) > 0 else r["down_odds"]) < 1
     ]
 
     if not all_gap10:
