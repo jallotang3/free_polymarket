@@ -115,6 +115,7 @@ class LateStageArbitrageStrategy:
         cl_age: Optional[int]   = None,
         bn_gap: Optional[float] = None,
         ptb_delay_secs: int = 0,
+        signal_confidence: float = 1.0,
     ) -> Optional[Signal]:
         state = self.get_window_state(window_ts)
 
@@ -196,7 +197,7 @@ class LateStageArbitrageStrategy:
         # ── 路径 2（赔率强信号）：gap 不足但赔率极强 ──
         # 适用：CL gap < 0.05% 但 CLOB 赔率已明确指向一侧
         # 触发：赔率单边 >= 0.72 + (已跳变+min>=1) 或 min>=3
-        sig = self._eval_odds_only(state, market, gap, gap_src, minute, secs_remaining)
+        sig = self._eval_odds_only(state, market, gap, gap_src, minute, secs_remaining, signal_confidence)
         if sig is not None:
             return sig
 
@@ -224,14 +225,17 @@ class LateStageArbitrageStrategy:
         if orderbook is not None:
             theo_wr = self._adjust_for_orderbook(theo_wr, direction, market_price, orderbook)
 
+        if gap_abs < 0.10:
+            logger.debug("gap 不足 0.10%%（%.3f%%），弱套利不下单", gap_abs)
+            return None
+
         kelly    = self._kelly(theo_wr, market_price)
-        sig_type = "末期套利" if gap_abs >= 0.10 else "弱套利"
         signal   = Signal(
             direction=direction, token_id=token_id,
             theoretical_win_rate=theo_wr, market_price=market_price,
             ev_per_unit=ev, ev_after_fee=ev_fee, gap_pct=gap, gap_src=gap_src,
             seconds_remaining=secs_remaining, kelly_fraction=kelly,
-            bet_amount=self.total_capital * kelly, signal_type=sig_type,
+            bet_amount=self.total_capital * kelly, signal_type="末期套利",
         )
         if signal.is_valid:
             logger.info("🟢 %s 信号: %s", sig_type, signal.summary())
@@ -242,18 +246,22 @@ class LateStageArbitrageStrategy:
     def _eval_odds_only(
         self, state: WindowState, market: MarketInfo,
         gap: float, gap_src: str, minute: int, secs_remaining: int,
+        signal_confidence: float = 1.0,
     ) -> Optional[Signal]:
         """
         路径2：gap 不足（< 0.05%）但 CLOB 赔率极强时的独立信号。
-        触发条件：赔率单边 >= 0.72 且（已跳变+minute>=1）或（minute>=3）
+        分层触发：
+          minute=1: 已跳变 + (gap同向≥0.02% 或 赔率≥0.85) + 历史可信度≥0.40
+          minute=2: 已跳变 + (gap同向≥0.01% 或 赔率≥0.75) + 历史可信度≥0.35
+          minute≥3: 赔率≥0.72（无需跳变/gap/context）
         """
         odds_dominant = max(market.up_odds, market.down_odds)
         if odds_dominant < STRONG_ODDS_THRESH:
             return None
 
-        odds_dir  = Direction.DOWN if market.down_odds >= market.up_odds else Direction.UP
-        odds_px   = market.down_odds if odds_dir == Direction.DOWN else market.up_odds
-        token_id  = market.down_token if odds_dir == Direction.DOWN else market.up_token
+        odds_dir = Direction.DOWN if market.down_odds >= market.up_odds else Direction.UP
+        odds_px  = market.down_odds if odds_dir == Direction.DOWN else market.up_odds
+        token_id = market.down_token if odds_dir == Direction.DOWN else market.up_token
 
         timing_ok     = (state.odds_jumped and minute >= 1) or minute >= 3
         gap_conflicts = (
@@ -263,6 +271,28 @@ class LateStageArbitrageStrategy:
         )
         if not timing_ok or gap_conflicts:
             return None
+
+        # 早期分钟额外验证：防止"假跳变"（近零gap + 历史无支撑）
+        if state.odds_jumped and minute <= 2:
+            gap_same_dir = (
+                (odds_dir == Direction.DOWN and gap < 0) or
+                (odds_dir == Direction.UP   and gap > 0)
+            )
+            if minute == 1:
+                min_gap, min_odds_solo, min_conf = 0.02, 0.85, 0.40
+            else:
+                min_gap, min_odds_solo, min_conf = 0.01, 0.75, 0.35
+
+            gap_confirmed = gap_same_dir and abs(gap) >= min_gap
+            odds_solo_ok  = odds_px >= min_odds_solo
+            conf_ok       = signal_confidence >= min_conf
+
+            if not ((gap_confirmed or odds_solo_ok) and conf_ok):
+                logger.debug(
+                    "赔率强信号早期拦截: min=%d gap=%.3f%% odds=%.2f conf=%.2f",
+                    minute, gap, odds_px, signal_confidence,
+                )
+                return None
 
         theo_wr  = 0.897 if odds_px < 0.85 else 0.968
         ev       = theo_wr * (1 - odds_px) - (1 - theo_wr) * odds_px

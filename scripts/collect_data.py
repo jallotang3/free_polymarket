@@ -410,26 +410,56 @@ def analyze_opportunity(
 
     # ── 独立赔率强信号（gap 不足时以市场定价为准）──
     # 适用场景：CL gap < 0.05%（链上价格偏差/市场提前定价），但 CLOB 赔率已极强
-    # 触发条件：赔率单边 >= 0.72 且（已跳变 + minute>=1）或（minute>=3）
+    # 触发条件（分层）：
+    #   minute=1：已跳变 + gap同向≥0.02% 或 赔率≥0.85 + 历史可信度≥0.40
+    #   minute=2：已跳变 + gap同向≥0.01% 或 赔率≥0.75 + 历史可信度≥0.35
+    #   minute≥3：赔率≥0.72（无需跳变，无需gap）
     _STRONG_ODDS = 0.72
     odds_dominant_price = max(up_odds, down_odds)
     if odds_dominant_price >= _STRONG_ODDS:
         odds_dir   = "DOWN" if down_odds >= up_odds else "UP"
         odds_price = down_odds if odds_dir == "DOWN" else up_odds
-        # 时机：已跳变则 minute>=1 即可入场；未跳变须等到 minute>=3
-        timing_ok = (obs.get("_odds_jumped", False) and minute >= 1) or minute >= 3
-        # 大gap且方向与赔率相反 → 留给强冲突分支；小gap或同向 → 走此路径
+        jumped     = obs.get("_odds_jumped", False)
+
+        # 时机：已跳变则 minute>=1 即可进入；未跳变须等到 minute>=3
+        timing_ok = (jumped and minute >= 1) or minute >= 3
+
+        # 大gap且方向与赔率相反 → 留给强冲突分支
         gap_conflicts = (
             abs(gap) >= 0.05 and
             ((odds_dir == "DOWN" and gap > 0) or (odds_dir == "UP" and gap < 0))
         )
-        if timing_ok and not gap_conflicts:
+
+        # ── 早期分钟（1-2）额外验证：防止"假跳变"误判 ──
+        early_ok = True
+        if timing_ok and jumped and minute <= 2:
+            # gap 是否同方向（哪怕很小）
+            gap_same_dir = (odds_dir == "DOWN" and gap < 0) or (odds_dir == "UP" and gap > 0)
+            # 按分钟设定最低 gap 和最低赔率门槛
+            if minute == 1:
+                min_gap       = 0.02   # gap 同方向 >= 0.02% 才够
+                min_odds_solo = 0.85   # 无gap时赔率至少 0.85
+                min_conf      = 0.40   # 历史上下文可信度
+            else:  # minute == 2
+                min_gap       = 0.01
+                min_odds_solo = 0.75
+                min_conf      = 0.35
+
+            gap_confirmed  = gap_same_dir and abs(gap) >= min_gap
+            odds_solo_ok   = odds_price >= min_odds_solo
+            conf_ok        = (obs.get("signal_confidence") or 1.0) >= min_conf
+
+            # 需满足：(gap确认 或 赔率足够强) 且 历史可信度过关
+            if not ((gap_confirmed or odds_solo_ok) and conf_ok):
+                early_ok = False
+
+        if timing_ok and not gap_conflicts and early_ok:
             theo_wr  = 0.897 if odds_price < 0.85 else 0.968
             ev       = theo_wr * (1 - odds_price) - (1 - theo_wr) * odds_price
             fee_frac = 0.25 * (odds_price * (1 - odds_price)) ** 2
             ev_fee   = ev - theo_wr * fee_frac
             if ev > 0.05:
-                jump_tag = "跳变+" if obs.get("_odds_jumped") else ""
+                jump_tag = "跳变+" if jumped else ""
                 src_tag  = f"[{gap_src}]" if gap_src != "CC" else ""
                 return (
                     f"🟢 跟赔率! 方向={odds_dir}({jump_tag}赔率={odds_price:.2f}) "
@@ -466,12 +496,9 @@ def analyze_opportunity(
     if ev > 0.05:
         return (f"🟢 强套利! 方向={direction} 理论={theo_wr:.1%} 赔率={market_price:.2f} "
                 f"EV={ev:+.3f}(含费≈{ev_fee:+.3f}){src_tag}{conflict_tag}")
-    if ev > 0.02:
-        return (f"🟡 弱套利  方向={direction} 理论={theo_wr:.1%} 赔率={market_price:.2f} "
-                f"EV={ev:+.3f}(含费≈{ev_fee:+.3f}){src_tag}{conflict_tag}")
     if ev > 0:
-        return (f"⚪ 微弱    方向={direction} 理论={theo_wr:.1%} 赔率={market_price:.2f} "
-                f"EV={ev:+.3f}{src_tag}")
+        return (f"⚪ EV不足  方向={direction} 理论={theo_wr:.1%} 赔率={market_price:.2f} "
+                f"EV={ev:+.3f}(阈值0.05，不下单){src_tag}")
     return (f"🔴 无利润  方向={direction} 理论={theo_wr:.1%} 赔率={market_price:.2f} "
             f"EV={ev:+.3f} (市场已定价)")
 
