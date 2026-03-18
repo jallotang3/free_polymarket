@@ -310,13 +310,24 @@ class LateStageArbitrageStrategy:
 
         kelly     = self._kelly(theo_wr, odds_px)
         jump_note = "跳变+" if state.odds_jumped else ""
+        # 标注 gap 状态，方便事后分析
+        gap_same_dir = (
+            (odds_dir == Direction.DOWN and gap < 0) or
+            (odds_dir == Direction.UP   and gap > 0)
+        )
+        if abs(gap) < 0.01:
+            gap_note = "gap≈0"
+        elif gap_same_dir:
+            gap_note = f"gap同向{gap:+.3f}%"
+        else:
+            gap_note = f"gap反向{gap:+.3f}%⚠"
         sig = Signal(
             direction=odds_dir, token_id=token_id,
             theoretical_win_rate=theo_wr, market_price=odds_px,
             ev_per_unit=ev, ev_after_fee=ev_fee, gap_pct=gap, gap_src=gap_src,
             seconds_remaining=secs_remaining, kelly_fraction=kelly,
             bet_amount=self.total_capital * kelly, signal_type="跟赔率",
-            note=f"{jump_note}赔率={odds_px:.2f}（gap不足，以市场定价为准）",
+            note=f"{jump_note}赔率={odds_px:.2f} {gap_note}",
         )
         if sig.is_valid:
             logger.info("🟢 赔率强信号: %s", sig.summary())

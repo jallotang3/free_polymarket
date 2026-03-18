@@ -504,6 +504,20 @@ def main():
     logger.info("=" * 60)
 
     if mode == "live":
+        # 预检：实盘依赖
+        try:
+            import py_clob_client  # noqa: F401
+        except ImportError:
+            logger.error(
+                "实盘模式需要 py-clob-client，当前 Python 未安装。\n"
+                "  请使用项目虚拟环境运行：\n"
+                "    ./run_bot.sh --mode live\n"
+                "  或手动激活后运行：\n"
+                "    source .venv/bin/activate\n"
+                "    python -m src.bot --mode live"
+            )
+            sys.exit(1)
+
         if not cfg.has_wallet:
             logger.error("实盘模式需要在 .env 中配置 PRIVATE_KEY 和 WALLET_ADDRESS")
             sys.exit(1)
