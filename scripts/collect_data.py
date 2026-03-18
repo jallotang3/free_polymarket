@@ -659,7 +659,7 @@ async def main():
             print(
                 f"[{ts_str}] 分{minute} | "
                 f"BTC=${btc_price:,.1f} {cl_status} {gap_str} | "
-                f"Up={mkt['up_odds']:.2f} Down={mkt['down_odds']:.2f} | "
+                f"Up={clob_up:.2f} Down={clob_dn:.2f} | "
                 f"{signal}{odds_jump_signal}{odds_static_warn}"
             )
 
