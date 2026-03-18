@@ -447,7 +447,9 @@ def analyze_opportunity(
 
             gap_confirmed  = gap_same_dir and abs(gap) >= min_gap
             odds_solo_ok   = odds_price >= min_odds_solo
-            conf_ok        = (obs.get("signal_confidence") or 1.0) >= min_conf
+            conf_key = "signal_confidence_up" if odds_dir == "UP" else "signal_confidence_dn"
+            raw_conf = obs.get(conf_key)
+            conf_ok  = (raw_conf if raw_conf is not None else 1.0) >= min_conf
 
             # 需满足：(gap确认 或 赔率足够强) 且 历史可信度过关
             if not ((gap_confirmed or odds_solo_ok) and conf_ok):
@@ -736,6 +738,21 @@ async def main():
 
             ptb_delay = ptb_delay_cache.get(window_ts, 0)
 
+            # ── Phase 2：历史背景评分（先于 analyze_opportunity，写入 obs 供其过滤）──
+            # 预计算两个方向的置信度，取较高值写入 obs["signal_confidence"]
+            # analyze_opportunity 内部会用这个值做早期分钟过滤
+            ctx_tag     = ""
+            ctx_conf_up = None
+            ctx_conf_dn = None
+            if mc is not None and ctx_data is not None:
+                res_up = mc.signal_confidence("UP",   primary_gap, minute)
+                res_dn = mc.signal_confidence("DOWN", primary_gap, minute)
+                ctx_conf_up = res_up["score"]
+                ctx_conf_dn = res_dn["score"]
+                # 写入 obs 供 analyze_opportunity 的早期分钟拦截使用（方向各自独立）
+                obs["signal_confidence_up"] = ctx_conf_up
+                obs["signal_confidence_dn"] = ctx_conf_dn
+
             signal = analyze_opportunity(
                 obs,
                 btc_trend_pct=btc_trend_pct,
@@ -745,21 +762,18 @@ async def main():
                 cl_age=cl_age,
             )
 
-            # ── Phase 2：历史背景评分（仅附加信息，不改变核心信号）──
-            ctx_tag = ""
+            # ── Phase 2：历史背景标签（信号确定后，精确计算当前方向的置信度）──
             if mc is not None and ctx_data is not None:
                 direction = _extract_direction(signal)
                 if direction:
                     conf = mc.signal_confidence(direction, primary_gap, minute)
-                    # 更新 signal_aligned（有方向信号时才有意义）
                     aligned = conf["trend_aligned"]
                     obs["signal_aligned"] = (
                         1 if aligned is True else
                         0 if aligned is False else
                         None
                     )
-                    # 构建标签：有强套利/弱套利信号时显示，无信号时只记录不显示
-                    if "🟢" in signal or "🟡" in signal:
+                    if "🟢" in signal:
                         rec = conf["recommended_gap_threshold"]
                         rec_str = f" 建议gap≥{rec:.2f}%" if rec > 0.05 else ""
                         ctx_tag = f" [{conf['note']} 可信={conf['score']:.2f}{rec_str}]"
