@@ -437,9 +437,16 @@ def analyze_opportunity(
             gap_same_dir = (odds_dir == "DOWN" and gap < 0) or (odds_dir == "UP" and gap > 0)
             # 按分钟设定最低 gap 和最低赔率门槛
             if minute == 1:
-                min_gap       = 0.02   # gap 同方向 >= 0.02% 才够
-                min_odds_solo = 0.85   # 无gap时赔率至少 0.85
-                min_conf      = 0.40   # 历史上下文可信度
+                # UP 逆势（confidence 低）门槛更严：paper 交易显示分1 UP 假阳性率高
+                raw_conf_for_check = obs.get("signal_confidence_up" if odds_dir == "UP" else "signal_confidence_dn")
+                if odds_dir == "UP" and (raw_conf_for_check or 1.0) < 0.50:
+                    min_gap       = 0.03
+                    min_odds_solo = 0.85
+                    min_conf      = 0.50
+                else:
+                    min_gap       = 0.02   # gap 同方向 >= 0.02% 才够
+                    min_odds_solo = 0.85   # 无gap时赔率至少 0.85
+                    min_conf      = 0.40   # 历史上下文可信度
             else:  # minute == 2
                 min_gap       = 0.01
                 min_odds_solo = 0.75
@@ -456,7 +463,8 @@ def analyze_opportunity(
                 early_ok = False
 
         if timing_ok and not gap_conflicts and early_ok:
-            theo_wr  = 0.897 if odds_price < 0.85 else 0.968
+            # paper 交易验证：赔率0.72~0.85区间实际胜率约86%，修正偏乐观的0.897
+            theo_wr  = 0.860 if odds_price < 0.85 else 0.968
             ev       = theo_wr * (1 - odds_price) - (1 - theo_wr) * odds_price
             fee_frac = 0.25 * (odds_price * (1 - odds_price)) ** 2
             ev_fee   = ev - theo_wr * fee_frac

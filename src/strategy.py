@@ -279,7 +279,11 @@ class LateStageArbitrageStrategy:
                 (odds_dir == Direction.UP   and gap > 0)
             )
             if minute == 1:
-                min_gap, min_odds_solo, min_conf = 0.02, 0.85, 0.40
+                # UP 逆势（confidence 低）门槛更严：paper 交易显示分1 UP 假阳性率高
+                if odds_dir == Direction.UP and signal_confidence < 0.50:
+                    min_gap, min_odds_solo, min_conf = 0.03, 0.85, 0.50
+                else:
+                    min_gap, min_odds_solo, min_conf = 0.02, 0.85, 0.40
             else:
                 min_gap, min_odds_solo, min_conf = 0.01, 0.75, 0.35
 
@@ -289,12 +293,13 @@ class LateStageArbitrageStrategy:
 
             if not ((gap_confirmed or odds_solo_ok) and conf_ok):
                 logger.debug(
-                    "赔率强信号早期拦截: min=%d gap=%.3f%% odds=%.2f conf=%.2f",
-                    minute, gap, odds_px, signal_confidence,
+                    "赔率强信号早期拦截: min=%d dir=%s gap=%.3f%% odds=%.2f conf=%.2f",
+                    minute, odds_dir.value, gap, odds_px, signal_confidence,
                 )
                 return None
 
-        theo_wr  = 0.897 if odds_px < 0.85 else 0.968
+        # 路径2理论胜率：paper 交易验证赔率0.72~0.85区间实际胜率约86%，修正偏乐观的0.897
+        theo_wr  = 0.860 if odds_px < 0.85 else 0.968
         ev       = theo_wr * (1 - odds_px) - (1 - theo_wr) * odds_px
         fee_frac = 0.25 * (odds_px * (1 - odds_px)) ** 2
         ev_fee   = ev - theo_wr * fee_frac
