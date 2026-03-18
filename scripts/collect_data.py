@@ -437,14 +437,17 @@ def analyze_opportunity(
             gap_same_dir = (odds_dir == "DOWN" and gap < 0) or (odds_dir == "UP" and gap > 0)
             # 按分钟设定最低 gap 和最低赔率门槛
             if minute == 1:
-                # UP 逆势（confidence 低）门槛更严：paper 交易显示分1 UP 假阳性率高
-                raw_conf_for_check = obs.get("signal_confidence_up" if odds_dir == "UP" else "signal_confidence_dn")
-                if odds_dir == "UP" and (raw_conf_for_check or 1.0) < 0.50:
+                # 低可信度（逆势）时不论方向均收紧门槛，避免假跳变
+                # paper 交易分1亏损根本原因是低 confidence + 小 gap，与方向无关
+                conf_key_m1    = "signal_confidence_up" if odds_dir == "UP" else "signal_confidence_dn"
+                raw_conf_m1    = obs.get(conf_key_m1)
+                conf_val_m1    = raw_conf_m1 if raw_conf_m1 is not None else 1.0
+                if conf_val_m1 < 0.50:
                     min_gap       = 0.03
                     min_odds_solo = 0.85
                     min_conf      = 0.50
                 else:
-                    min_gap       = 0.02   # gap 同方向 >= 0.02% 才够
+                    min_gap       = 0.02   # gap 同方向 >= 0.02%
                     min_odds_solo = 0.85   # 无gap时赔率至少 0.85
                     min_conf      = 0.40   # 历史上下文可信度
             else:  # minute == 2

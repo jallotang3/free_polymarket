@@ -279,8 +279,9 @@ class LateStageArbitrageStrategy:
                 (odds_dir == Direction.UP   and gap > 0)
             )
             if minute == 1:
-                # UP 逆势（confidence 低）门槛更严：paper 交易显示分1 UP 假阳性率高
-                if odds_dir == Direction.UP and signal_confidence < 0.50:
+                # 低可信度（逆势）时不论方向均收紧门槛，避免假跳变
+                # paper 交易分1亏损根本原因是低 confidence + 小 gap，与方向无关
+                if signal_confidence < 0.50:
                     min_gap, min_odds_solo, min_conf = 0.03, 0.85, 0.50
                 else:
                     min_gap, min_odds_solo, min_conf = 0.02, 0.85, 0.40
