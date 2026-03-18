@@ -408,6 +408,34 @@ def analyze_opportunity(
                         f"赔率={market_price:.2f} EV={ev:+.3f}  [Chainlink赔率强确认]")
             return f"⚪ 跟赔率EV不足 方向={market_dir} 赔率={market_price:.2f} EV={ev:+.3f}"
 
+    # ── 独立赔率强信号（gap 不足时以市场定价为准）──
+    # 适用场景：CL gap < 0.05%（链上价格偏差/市场提前定价），但 CLOB 赔率已极强
+    # 触发条件：赔率单边 >= 0.72 且（已跳变 + minute>=1）或（minute>=3）
+    _STRONG_ODDS = 0.72
+    odds_dominant_price = max(up_odds, down_odds)
+    if odds_dominant_price >= _STRONG_ODDS:
+        odds_dir   = "DOWN" if down_odds >= up_odds else "UP"
+        odds_price = down_odds if odds_dir == "DOWN" else up_odds
+        # 时机：已跳变则 minute>=1 即可入场；未跳变须等到 minute>=3
+        timing_ok = (obs.get("_odds_jumped", False) and minute >= 1) or minute >= 3
+        # 大gap且方向与赔率相反 → 留给强冲突分支；小gap或同向 → 走此路径
+        gap_conflicts = (
+            abs(gap) >= 0.05 and
+            ((odds_dir == "DOWN" and gap > 0) or (odds_dir == "UP" and gap < 0))
+        )
+        if timing_ok and not gap_conflicts:
+            theo_wr  = 0.897 if odds_price < 0.85 else 0.968
+            ev       = theo_wr * (1 - odds_price) - (1 - theo_wr) * odds_price
+            fee_frac = 0.25 * (odds_price * (1 - odds_price)) ** 2
+            ev_fee   = ev - theo_wr * fee_frac
+            if ev > 0.05:
+                jump_tag = "跳变+" if obs.get("_odds_jumped") else ""
+                src_tag  = f"[{gap_src}]" if gap_src != "CC" else ""
+                return (
+                    f"🟢 跟赔率! 方向={odds_dir}({jump_tag}赔率={odds_price:.2f}) "
+                    f"理论≈{theo_wr:.1%} EV={ev:+.3f}(含费≈{ev_fee:+.3f}){src_tag}"
+                )
+
     # ── 理论胜率查表（末期套利核心逻辑）──
     def theo_win_rate(gap_abs: float, min_w: int) -> float:
         if min_w < 3:
