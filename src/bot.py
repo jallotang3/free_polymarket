@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-# 使 src 包可从项目根目录直接运行
 _root = Path(__file__).parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
@@ -27,27 +26,38 @@ if str(_root) not in sys.path:
 from src.config import cfg
 from src.data_feed import (
     BinancePriceFeed, PriceCache,
-    current_window_ts, get_market_info, get_orderbook,
-    seconds_into_window, seconds_remaining,
+    current_window_ts, seconds_into_window, seconds_remaining,
+    get_market_info, get_clob_midpoints, get_orderbook,
+    get_chainlink_onchain_price, get_btc_price_rest, get_cryptocompare_price,
 )
 from src.strategy import Direction, LateStageArbitrageStrategy, RiskManager
 from src.executor import TradeDB, TradeRecord, make_executor
 from src.monitor import dashboard, notifier, setup_logging
 
+# 历史背景模块（可选）
+try:
+    from scripts.market_context import MarketContext
+    _HAS_MC = True
+except ImportError:
+    try:
+        sys.path.insert(0, str(_root / "scripts"))
+        from market_context import MarketContext
+        _HAS_MC = True
+    except ImportError:
+        _HAS_MC = False
+
 logger = logging.getLogger("bot")
 
+CL_FRESH_SECS = 45   # Chainlink 链上价格新鲜阈值（秒）
 
-# ─────────────────────────────────────────────
-# 主 Bot 类
-# ─────────────────────────────────────────────
 
 class PolymarketBot:
     def __init__(self, mode: str, initial_capital: float):
-        self.mode = mode
+        self.mode           = mode
         self.initial_capital = initial_capital
 
         # 数据层
-        self.price_feed = BinancePriceFeed()
+        self.price_feed  = BinancePriceFeed()
         self.price_cache = PriceCache(ttl_secs=2)
 
         # 策略 & 风控
@@ -59,48 +69,58 @@ class PolymarketBot:
         self.db       = TradeDB(cfg.db_path)
         self.executor = make_executor(mode, self.db)
 
+        # 历史背景模块（Phase 2）
+        self.mc = MarketContext() if _HAS_MC else None
+
         # 状态
-        self._open_trades: dict[int, TradeRecord] = {}  # window_ts → TradeRecord
-        self._market_cache: dict[int, object] = {}      # window_ts → MarketInfo
+        self._open_trades:   dict[int, TradeRecord] = {}
+        self._market_cache:  dict[str, object]      = {}
         self._running = False
         self._last_window_ts: Optional[int] = None
-        self._price_to_beat: Optional[float] = None
 
-    # ── 生命周期 ──
+        # 价格状态（跨 tick 共享）
+        self._cl_last_price:     Optional[float] = None
+        self._cl_last_oracle_ts: Optional[int]   = None
+        self._cl_ptb_cache:      dict[int, float] = {}   # window_ts → CL PtB
+        self._cc_ptb_cache:      dict[int, float] = {}   # window_ts → CC PtB
+        self._bn_ptb_cache:      dict[int, float] = {}   # window_ts → BN PtB
+        self._ptb_delay_cache:   dict[int, int]   = {}   # window_ts → 延迟秒数
+
+        # CLOB 实时赔率状态
+        self._last_clob_up: Optional[float] = None
+        self._last_clob_dn: Optional[float] = None
+
+    # ── 生命周期 ──────────────────────────────────────
 
     async def start(self):
         self._running = True
         logger.info("Bot 启动 | 模式=%s | 资金=%.2f", self.mode, self.initial_capital)
         notifier.notify(notifier.system_start(self.mode, self.initial_capital))
 
-        # 验证配置
         issues = cfg.validate()
         if issues:
             for issue in issues:
                 logger.error("配置错误: %s", issue)
             sys.exit(1)
 
-        # 并发启动
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(self.price_feed.run(),     name="price_feed")
-            tg.create_task(notifier.run(),            name="telegram")
-            tg.create_task(self._main_loop(),         name="main_loop")
-            tg.create_task(self._settlement_loop(),   name="settlement")
+            tg.create_task(self.price_feed.run(),   name="price_feed")
+            tg.create_task(notifier.run(),          name="telegram")
+            tg.create_task(self._main_loop(),       name="main_loop")
+            tg.create_task(self._settlement_loop(), name="settlement")
 
     def stop(self, reason: str = "手动停止"):
         self._running = False
         self.price_feed.stop()
-        stats = self.risk.stats
+        stats     = self.risk.stats
         total_pnl = stats["pnl"]
         logger.info("Bot 停止 | %s | 总 PnL=%.2f", reason, total_pnl)
         notifier.notify(notifier.system_stop(reason, total_pnl))
 
-    # ── 主循环：每 5 秒轮询一次 ──
+    # ── 主循环 ─────────────────────────────────────────
 
     async def _main_loop(self):
         logger.info("主循环启动，轮询间隔 %ds", cfg.poll_interval_secs)
-
-        # 等待价格数据就绪
         price = await self.price_feed.wait_for_price(timeout=15)
         if price is None:
             logger.warning("WebSocket 价格超时，回退到 REST 模式")
@@ -113,83 +133,134 @@ class PolymarketBot:
             await asyncio.sleep(cfg.poll_interval_secs)
 
     async def _tick(self):
-        now = int(time.time())
+        now       = int(time.time())
         window_ts = current_window_ts()
         elapsed   = seconds_into_window()
-        remaining = seconds_remaining()
+        ts_str    = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
-        # ── 1. 获取 BTC 实时价格 ──
+        # ── 1. BTC 价格（三源） ──
+        loop     = asyncio.get_event_loop()
         btc_price = self.price_feed.price or await self.price_cache.get_async()
         if btc_price is None:
-            logger.warning("无法获取 BTC 价格，跳过本次 tick")
+            logger.warning("[%s] 无法获取 BTC 价格，跳过", ts_str)
             return
 
-        # ── 2. 新窗口开盘处理 ──
-        if window_ts != self._last_window_ts:
-            await self._on_new_window(window_ts, btc_price)
-            self._last_window_ts = window_ts
+        cc_price = await loop.run_in_executor(None, get_cryptocompare_price)
 
-        # ── 3. 同步策略资金 ──
+        # Chainlink 链上（轻量 RPC 调用）
+        cl_price, cl_oracle_ts = await loop.run_in_executor(
+            None, get_chainlink_onchain_price
+        )
+        if cl_price is not None:
+            self._cl_last_price     = cl_price
+            self._cl_last_oracle_ts = cl_oracle_ts
+        else:
+            cl_price     = self._cl_last_price
+            cl_oracle_ts = self._cl_last_oracle_ts
+
+        cl_age   = int(now - cl_oracle_ts) if cl_oracle_ts else None
+        cl_fresh = cl_age is not None and cl_age < CL_FRESH_SECS
+
+        # ── 2. 新窗口开盘 ──
+        if window_ts != self._last_window_ts:
+            await self._on_new_window(window_ts, btc_price, cc_price, cl_price, cl_fresh, elapsed)
+            self._last_window_ts = window_ts
+            self._last_clob_up   = None
+            self._last_clob_dn   = None
+
+        # ── 3. 三源 gap 计算 ──
+        bn_ptb  = self._bn_ptb_cache.get(window_ts, btc_price)
+        cc_ptb  = self._cc_ptb_cache.get(window_ts, cc_price or btc_price)
+        cl_ptb  = self._cl_ptb_cache.get(window_ts)
+
+        bn_gap_pct = (btc_price - bn_ptb) / bn_ptb * 100
+        cc_gap_pct = ((cc_price - cc_ptb) / cc_ptb * 100) if cc_price and cc_ptb else bn_gap_pct
+        cl_gap_pct = None
+        if cl_price and cl_ptb and cl_fresh:
+            cl_gap_pct = (cl_price - cl_ptb) / cl_ptb * 100
+        elif cl_price and cc_ptb and cl_fresh:
+            cl_gap_pct = (cl_price - cc_ptb) / cc_ptb * 100
+
+        # ── 4. Gamma 静态信息（每窗口一次） ──
+        market = await self._get_market(window_ts)
+        if market is None:
+            logger.warning("[%s] ⚠️ 市场数据获取失败", ts_str)
+            return
+
+        # ── 5. CLOB 实时赔率（每 poll 调用） ──
+        clob_up, clob_dn = await loop.run_in_executor(
+            None, get_clob_midpoints, market.up_token, market.down_token
+        )
+        if clob_up is not None and clob_dn is not None:
+            self._last_clob_up, self._last_clob_dn = clob_up, clob_dn
+        else:
+            clob_up = self._last_clob_up if self._last_clob_up is not None else market.gamma_up
+            clob_dn = self._last_clob_dn if self._last_clob_dn is not None else market.gamma_dn
+            if self._last_clob_up is None:
+                logger.warning("[%s] ⚠️ CLOB 赔率获取失败，使用 Gamma 初始值", ts_str)
+
+        market.update_clob_odds(clob_up, clob_dn)
+
+        # 赔率跳变检测（用于动态软冲突阈值）
+        self.strategy.update_odds_history(window_ts, clob_up)
+
+        # ── 6. 同步资金 ──
         self.strategy.update_capital(self.risk.current_capital)
 
-        # ── 4. 仅在入场窗口内评估信号 ──
+        # ── 7. 心跳日志 ──
+        primary_gap = cl_gap_pct if cl_gap_pct is not None and cl_fresh else cc_gap_pct
+        cl_tag = f"CL=${cl_price:,.0f}({cl_age}s)" if cl_price else "CL=N/A"
+        gap_arrow = "↑" if primary_gap > 0 else ("↓" if primary_gap < 0 else "─")
+        gap_str   = f"{gap_arrow}{primary_gap:+.3f}%"
+        logger.info(
+            "[%s] 分%d | BTC=$%.1f %s %s | Up=%.2f Down=%.2f | cap=$%.2f",
+            ts_str, elapsed // 60, btc_price, cl_tag, gap_str,
+            clob_up, clob_dn, self.risk.current_capital,
+        )
+
+        dashboard.maybe_print(btc_price, primary_gap, window_ts,
+                              self.risk.current_capital, self.risk.stats, self.mode)
+
+        # ── 8. 入场窗口检查 ──
         if not (cfg.entry_window_start <= elapsed <= cfg.entry_window_end):
-            gap_pct = None
-            if self._price_to_beat and btc_price:
-                gap_pct = (btc_price - self._price_to_beat) / self._price_to_beat * 100
-            # 每分钟输出一次心跳日志，证明 Bot 正在运行
-            if elapsed % 60 < cfg.poll_interval_secs:
-                gap_str = f"{gap_pct:+.3f}%" if gap_pct is not None else "N/A"
-                logger.debug(
-                    "⏳ 等待入场窗口 [%ds/%ds]  BTC=$%.2f  gap=%s  资金=$%.2f",
-                    elapsed, 300, btc_price, gap_str, self.risk.current_capital,
-                )
-            dashboard.maybe_print(
-                btc_price, gap_pct, window_ts,
-                self.risk.current_capital, self.risk.stats, self.mode
-            )
             return
 
-        # ── 5. 风控检查 ──
+        # ── 9. 风控检查 ──
         allowed, reason = self.risk.allow_trade()
         if not allowed:
             logger.warning("风控拦截: %s", reason)
             return
 
-        # ── 6. 获取市场数据（每分钟刷新一次）──
-        market = await self._get_market(window_ts, elapsed)
-        if market is None:
-            logger.warning("窗口 %d 市场数据获取失败，跳过本次 tick（elapsed=%ds）", window_ts, elapsed)
-            return
-
-        # ── 7. 获取订单簿（仅在信号可能触发时）──
+        # ── 10. 评估信号 ──
         orderbook = None
-        if self._price_to_beat:
-            gap_abs = abs((btc_price - self._price_to_beat) / self._price_to_beat * 100)
-            if gap_abs >= cfg.min_gap_pct:
-                direction_token = market.up_token if btc_price > self._price_to_beat else market.down_token
-                orderbook = await asyncio.get_event_loop().run_in_executor(
-                    None, get_orderbook, direction_token
-                )
+        if abs(primary_gap) >= cfg.min_gap_pct:
+            direction_token = market.up_token if primary_gap > 0 else market.down_token
+            orderbook = await loop.run_in_executor(None, get_orderbook, direction_token)
 
-        # ── 8. 评估信号 ──
-        gap_pct = (btc_price - self._price_to_beat) / self._price_to_beat * 100 if self._price_to_beat else 0
-        logger.debug(
-            "🔍 评估信号 窗口%d | BTC=$%.2f gap=%+.3f%% Up=%.3f Down=%.3f elapsed=%ds",
-            window_ts, btc_price, gap_pct, market.up_odds, market.down_odds, elapsed,
-        )
+        ptb_delay = self._ptb_delay_cache.get(window_ts, 0)
+
         signal = self.strategy.evaluate(
-            window_ts=window_ts,
-            btc_price=btc_price,
-            market=market,
-            orderbook=orderbook,
-            seconds_elapsed=elapsed,
+            window_ts      = window_ts,
+            btc_price      = btc_price,
+            market         = market,
+            orderbook      = orderbook,
+            seconds_elapsed = elapsed,
+            cl_gap         = cl_gap_pct,
+            cl_age         = cl_age,
+            bn_gap         = bn_gap_pct,
+            ptb_delay_secs = ptb_delay,
         )
 
         if signal is None or not signal.is_valid:
             return
 
-        # ── 9. 执行下单 ──
+        # ── 历史背景评分（信息性，不阻止下单） ──
+        if self.mc is not None:
+            conf = self.mc.signal_confidence(signal.direction.value, primary_gap, elapsed // 60)
+            if conf["note"]:
+                signal.note = conf["note"] + f" 可信={conf['score']:.2f}"
+
+        # ── 11. 执行下单 ──
         trade = await self.executor.place(signal, window_ts)
         if trade is None:
             logger.error("下单失败")
@@ -197,91 +268,106 @@ class PolymarketBot:
 
         self._open_trades[window_ts] = trade
         self.strategy.mark_traded(window_ts, signal.direction)
-
         notifier.notify(notifier.trade_opened(
             self.mode, signal.direction.value, signal.bet_amount,
-            signal.market_price, signal.ev_per_unit, signal.gap_pct
+            signal.market_price, signal.ev_per_unit, signal.gap_pct,
         ))
 
-    # ── 结算循环：窗口结束后查询结果 ──
+    # ── 结算循环 ──────────────────────────────────────
 
     async def _settlement_loop(self):
-        """每 30 秒检查一次是否有已关闭的窗口需要结算"""
-        _heartbeat_count = 0
+        _hb = 0
         while self._running:
             await asyncio.sleep(30)
-            _heartbeat_count += 1
-            pending = len(self._open_trades)
-            if pending > 0 or _heartbeat_count % 10 == 0:  # 有持仓时每次打，无持仓每 5 分钟一次
-                logger.debug(
-                    "结算检查 | 待结算=%d笔  累计交易=%d笔  PnL=%+.2f",
-                    pending, self.risk.stats["trades"], self.risk.stats["pnl"],
-                )
+            _hb += 1
+            if len(self._open_trades) > 0 or _hb % 10 == 0:
+                logger.debug("结算检查 | 待结算=%d | PnL=%+.2f",
+                             len(self._open_trades), self.risk.stats["pnl"])
             await self._settle_closed_windows()
 
     async def _settle_closed_windows(self):
         now = int(time.time())
-        to_settle = [
-            wts for wts in list(self._open_trades.keys())
-            if now > wts + 310  # 窗口结束后 10 秒才查结果（等 Chainlink 更新）
-        ]
+        to_settle = [wts for wts in list(self._open_trades)
+                     if now > wts + 310]
+        loop = asyncio.get_event_loop()
 
         for wts in to_settle:
-            trade = self._open_trades.pop(wts)
-            result = await self._fetch_result(wts, trade)
-            if result is None:
-                logger.warning("窗口 %d 结果查询失败，稍后重试", wts)
+            trade  = self._open_trades.pop(wts)
+            market = await loop.run_in_executor(None, get_market_info, wts)
+            if market is None or not market.closed:
                 self._open_trades[wts] = trade  # 放回重试
                 continue
 
+            result = ("Up"   if market.gamma_up   >= 0.99 else
+                      "Down" if market.gamma_dn    >= 0.99 else
+                      "Up"   if market.gamma_up    >  0.5  else "Down")
+
             pnl = await self.executor.settle(trade, result)
             self.risk.record_result(result == trade.direction, pnl)
-
             notifier.notify(notifier.trade_settled(
                 self.mode, trade.direction, result,
-                pnl, self.risk.win_rate, self.risk.stats["pnl"]
+                pnl, self.risk.win_rate, self.risk.stats["pnl"],
             ))
 
-    async def _fetch_result(self, window_ts: int, trade: TradeRecord) -> Optional[str]:
-        """查询窗口的实际结算结果"""
-        loop = asyncio.get_event_loop()
-        market = await loop.run_in_executor(None, get_market_info, window_ts)
-        if market is None:
-            return None
-        if not market.closed:
-            logger.debug("窗口 %d 尚未结算", window_ts)
-            return None
-        # 赔率为 1 的方向就是赢家
-        if market.up_odds >= 0.99:
-            return "Up"
-        elif market.down_odds >= 0.99:
-            return "Down"
-        # 中间状态：根据赔率判断（>0.5 一侧视为赢家）
-        return "Up" if market.up_odds > market.down_odds else "Down"
+    # ── 辅助方法 ─────────────────────────────────────
 
-    # ── 辅助方法 ──
+    async def _on_new_window(
+        self, window_ts: int, btc_price: float,
+        cc_price: Optional[float], cl_price: Optional[float],
+        cl_fresh: bool, elapsed: int,
+    ):
+        """窗口开盘初始化：记录 PtB（优先 Chainlink链上 > CC > BN）"""
+        self._bn_ptb_cache[window_ts] = btc_price
+        self._cc_ptb_cache[window_ts] = cc_price or btc_price
+        if cl_price and cl_fresh:
+            self._cl_ptb_cache[window_ts] = cl_price
+        self._ptb_delay_cache[window_ts] = elapsed
 
-    async def _on_new_window(self, window_ts: int, btc_price: float):
-        """新窗口开盘时的初始化逻辑"""
-        self._price_to_beat = btc_price
-        self._market_cache.pop(window_ts - 300, None)  # 清理上个窗口缓存
+        if cl_price and cl_fresh:
+            ptb     = cl_price
+            ptb_src = f"CL链上PtB=${cl_price:,.2f}"
+        elif cc_price:
+            ptb     = cc_price
+            ptb_src = f"CC估算PtB=${cc_price:,.2f}"
+        else:
+            ptb     = btc_price
+            ptb_src = f"BN估算PtB=${btc_price:,.2f}"
 
-        self.strategy.set_price_to_beat(window_ts, btc_price)
-        logger.info(
-            "── 新窗口 ts=%d  PtB=$%.2f  资金=%.2f  已交易=%d笔 ──",
-            window_ts, btc_price, self.risk.current_capital, self.risk.stats["trades"]
-        )
+        quality = ("精确" if elapsed <= cfg.poll_interval_secs else
+                   f"轻微延迟({elapsed}s)" if elapsed <= 30 else
+                   f"⚠️延迟较大({elapsed}s)")
+        logger.info("── 新窗口 ts=%d  %s  [%s]  资金=$%.2f ──",
+                    window_ts, ptb_src, quality, self.risk.current_capital)
 
-    async def _get_market(self, window_ts: int, elapsed: int) -> Optional[object]:
-        """获取市场数据，按分钟缓存（减少 API 请求）"""
-        cache_key = f"{window_ts}_{elapsed // 60}"
-        if cache_key in self._market_cache:
-            return self._market_cache[cache_key]
+        # 策略层更新 PtB
+        self.strategy.set_price_to_beat(window_ts, ptb)
 
-        loop = asyncio.get_event_loop()
+        # 历史背景预取（异步）
+        if self.mc is not None:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.mc.refresh, True)
+
+        # 清理旧缓存
+        old = window_ts - 600
+        for cache in (self._bn_ptb_cache, self._cc_ptb_cache,
+                      self._cl_ptb_cache, self._ptb_delay_cache):
+            for k in list(cache):
+                if k < old:
+                    del cache[k]
+
+    async def _get_market(self, window_ts: int) -> Optional[object]:
+        """Gamma 静态信息（每窗口仅一次）"""
+        key = str(window_ts)
+        if key in self._market_cache:
+            return self._market_cache[key]
+        loop   = asyncio.get_event_loop()
         market = await loop.run_in_executor(None, get_market_info, window_ts)
         if market:
-            self._market_cache[cache_key] = market
+            self._market_cache[key] = market
+            # 清理旧窗口缓存
+            old = str(window_ts - 600)
+            for k in [k for k in self._market_cache if k < old]:
+                del self._market_cache[k]
         return market
 
 
@@ -291,29 +377,17 @@ class PolymarketBot:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Polymarket BTC 末期套利机器人")
-    parser.add_argument(
-        "--mode", choices=["paper", "live"], default=cfg.mode,
-        help="运行模式：paper=纸面交易（默认），live=实盘"
-    )
-    parser.add_argument(
-        "--capital", type=float, default=1000.0,
-        help="初始模拟资金（paper 模式专用，默认 $1000）"
-    )
-    parser.add_argument(
-        "--debug", action="store_true",
-        help="开启 DEBUG 日志"
-    )
+    parser.add_argument("--mode",    choices=["paper", "live"], default=cfg.mode)
+    parser.add_argument("--capital", type=float, default=1000.0)
+    parser.add_argument("--debug",   action="store_true")
     return parser.parse_args()
 
 
 async def _run(mode: str, capital: float):
-    bot = PolymarketBot(mode=mode, initial_capital=capital)
-
-    # 优雅退出
+    bot  = PolymarketBot(mode=mode, initial_capital=capital)
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: bot.stop("收到退出信号"))
-
     try:
         await bot.start()
     except* KeyboardInterrupt:
@@ -328,15 +402,21 @@ def main():
     args = parse_args()
     setup_logging(logging.DEBUG if args.debug else logging.INFO)
 
-    mode = args.mode
+    mode    = args.mode
     capital = args.capital
 
-    logger.info("=" * 55)
+    logger.info("=" * 60)
     logger.info("  Polymarket BTC 末期套利 Bot")
     logger.info("  模式: %s  资金: $%.2f", mode.upper(), capital)
-    logger.info("  策略: gap >= %.2f%%  边际 >= %.2f",
-                cfg.min_gap_pct, cfg.entry_margin)
-    logger.info("=" * 55)
+    logger.info("  价格源: Chainlink链上 > CryptoCompare > Binance")
+    logger.info("  赔率源: CLOB 实时订单簿(每%ds) > Gamma 初始值(备用)",
+                cfg.poll_interval_secs)
+    if _HAS_MC:
+        logger.info("  历史背景: MarketContext(90m K线趋势/波动率)")
+    logger.info("  策略: gap >= %.2f%%  边际 >= %.2f  入场 %ds~%ds",
+                cfg.min_gap_pct, cfg.entry_margin,
+                cfg.entry_window_start, cfg.entry_window_end)
+    logger.info("=" * 60)
 
     if mode == "live":
         if not cfg.has_wallet:

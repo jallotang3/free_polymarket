@@ -1,17 +1,22 @@
 """
-末期定价套利策略引擎
+末期定价套利策略引擎（与 scripts/collect_data.py 的 analyze_opportunity 保持同步）
 
 核心逻辑：
-  在 5 分钟窗口的第 3:30~4:30 分钟，当 BTC 价格已明显领先开盘价时，
-  比较「理论胜率」与 Polymarket 实时赔率的差距，若差距 > 安全边际则入场。
+  在 5 分钟窗口的第 3:00~4:59，当 Chainlink 链上 BTC 价格已明显领先开盘价时，
+  比较「理论胜率」与 CLOB 实时赔率的差距，若差距 > 安全边际则入场。
 
-回测依据（7天/2015窗口）：
-  第4分钟 gap ≥ 0.10% → 真实胜率 96.8%
-  第4分钟 gap ≥ 0.20% → 真实胜率 98.2%
+数据源优先级（gap 计算）：
+  Chainlink 链上 gap (cl_age < 45s) > CryptoCompare gap > Binance gap
+
+信号逻辑（与 collect_data.py 严格同步）：
+  1. PtB 延迟 > 60s → 忽略 gap，仅赔率跳变信号有效
+  2. 软冲突检查：gap 方向与赔率对立时，静止偏置阈值 0.65 / 赔率跳变后阈值 0.58
+  3. 强冲突检查：gap ≥ 0.05% + 赔率 > 0.60 且方向相反 → 需 BN_COUNTER 确认才放行
+  4. 赔率强度不足（0.60~0.72）→ 不操作
+  5. 赔率强确认独立路径：赔率 ≥ 0.72 且已发生跳变 → 以赔率方向为准
 """
 
 import logging
-import math
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -22,6 +27,10 @@ from .data_feed import MarketInfo, OrderBook
 
 logger = logging.getLogger("strategy")
 
+CL_FRESH_SECS      = 45    # Chainlink 链上价格被视为"新鲜"的最大秒数
+BN_COUNTER_THRESH  = 0.08  # Binance gap 反向且幅度超此值时视为反向确认
+STRONG_ODDS_THRESH = 0.72  # 赔率强确认门槛（< 此值视为中等确信，不操作）
+
 
 class Direction(str, Enum):
     UP   = "Up"
@@ -31,14 +40,18 @@ class Direction(str, Enum):
 @dataclass
 class Signal:
     direction: Direction
-    token_id: str
-    theoretical_win_rate: float   # 基于历史数据的理论胜率
-    market_price: float           # Polymarket 当前赔率（我们要买入的价格）
-    ev_per_unit: float            # 期望收益/单位（正数才操作）
-    gap_pct: float                # BTC 价格与开盘价的差距百分比
-    seconds_remaining: int        # 窗口剩余秒数
-    kelly_fraction: float         # Kelly 建议仓位比例
-    bet_amount: float             # 建议投入金额（= 总资金 × kelly_fraction）
+    token_id:  str
+    theoretical_win_rate: float
+    market_price: float           # CLOB 实时赔率
+    ev_per_unit: float
+    ev_after_fee: float           # 扣除手续费后的 EV
+    gap_pct: float                # 主用 gap（CL链上 > CC > BN）
+    gap_src: str                  # "CL链上" / "CC" / "BN"
+    seconds_remaining: int
+    kelly_fraction: float
+    bet_amount: float
+    signal_type: str              # "末期套利" / "跟赔率" / "弱套利"
+    note: str = ""                # 背景说明（逆势/顺势等）
 
     @property
     def is_valid(self) -> bool:
@@ -46,36 +59,32 @@ class Signal:
             self.ev_per_unit >= cfg.min_ev_threshold
             and self.market_price < self.theoretical_win_rate
             and self.kelly_fraction > 0
-            and self.bet_amount > 1.0  # 至少 $1
+            and self.bet_amount >= 1.0
         )
 
     def summary(self) -> str:
         return (
-            f"{self.direction.value} | gap={self.gap_pct:+.3f}% | "
+            f"{self.direction.value} | gap={self.gap_pct:+.3f}%({self.gap_src}) | "
             f"TWR={self.theoretical_win_rate:.1%} | mkt={self.market_price:.3f} | "
-            f"EV={self.ev_per_unit:+.4f} | bet=${self.bet_amount:.2f} | "
-            f"剩余{self.seconds_remaining}s"
+            f"EV={self.ev_per_unit:+.4f}(费后≈{self.ev_after_fee:+.4f}) | "
+            f"bet=${self.bet_amount:.2f} | 剩余{self.seconds_remaining}s"
+            + (f" | {self.note}" if self.note else "")
         )
 
 
 @dataclass
 class WindowState:
-    """记录一个 5 分钟窗口的状态"""
     window_ts: int
-    price_to_beat: Optional[float] = None   # 开盘参考价
-    already_traded: bool = False            # 本窗口是否已下单
+    price_to_beat:  Optional[float] = None
+    already_traded: bool = False
     trade_direction: Optional[Direction] = None
+    odds_jumped:    bool = False           # 本窗口是否出现过赔率强跳（≥ 0.10）
+    prev_up_odds:   Optional[float] = None
 
 
 class LateStageArbitrageStrategy:
     """
-    末期定价套利策略
-
-    关键参数（来自 config.py）：
-      min_gap_pct:       触发信号的最小价格差距（默认 0.10%）
-      entry_margin:      理论胜率 - 市场赔率 的最小安全边际（默认 0.03）
-      min_ev_threshold:  最低期望收益（默认 0.02/单位）
-      entry_window_start/end: 允许入场的时间窗口（默认 210~270 秒，即 3:30~4:30）
+    末期定价套利策略（支持 CLOB 实时赔率 + Chainlink 链上 gap）
     """
 
     def __init__(self, total_capital: float):
@@ -85,18 +94,30 @@ class LateStageArbitrageStrategy:
     def get_window_state(self, window_ts: int) -> WindowState:
         if window_ts not in self._window_states:
             self._window_states[window_ts] = WindowState(window_ts=window_ts)
-            # 清理旧窗口（只保留最近10个）
             old_keys = sorted(self._window_states.keys())[:-10]
             for k in old_keys:
                 del self._window_states[k]
         return self._window_states[window_ts]
 
     def set_price_to_beat(self, window_ts: int, price: float):
-        """在窗口开盘时记录 Price-to-Beat"""
         state = self.get_window_state(window_ts)
         if state.price_to_beat is None:
             state.price_to_beat = price
-            logger.info("窗口 %d 开盘价（Price-to-Beat）= $%.2f", window_ts, price)
+            logger.info("窗口 %d 开盘价（PtB）= $%.2f", window_ts, price)
+
+    def update_odds_history(self, window_ts: int, up_odds: float):
+        """每 poll 调用，检测赔率跳变（用于动态软冲突阈值）"""
+        state = self.get_window_state(window_ts)
+        if state.prev_up_odds is not None:
+            delta = up_odds - state.prev_up_odds
+            if abs(delta) >= 0.10:
+                state.odds_jumped = True
+                jump_dir = "UP" if delta > 0 else "DOWN"
+                logger.info(
+                    "🔔 赔率跳变 %+.2f → %s=%.2f (CLOB实时)",
+                    delta, jump_dir, up_odds if delta > 0 else (1 - up_odds),
+                )
+        state.prev_up_odds = up_odds
 
     def evaluate(
         self,
@@ -105,115 +126,156 @@ class LateStageArbitrageStrategy:
         market: MarketInfo,
         orderbook: Optional[OrderBook] = None,
         seconds_elapsed: Optional[int] = None,
+        # Chainlink 链上 gap 参数
+        cl_gap: Optional[float] = None,
+        cl_age: Optional[int]   = None,
+        # BN gap（用于反向确认）
+        bn_gap: Optional[float] = None,
+        # PtB 延迟秒数
+        ptb_delay_secs: int = 0,
     ) -> Optional[Signal]:
         """
         评估当前是否有套利信号。
-        返回 Signal（含 is_valid 字段）或 None（数据不足）。
+        返回 Signal（含 is_valid 字段）或 None（无机会 / 数据不足）。
         """
         state = self.get_window_state(window_ts)
 
-        # 1. 确保有开盘价
         if state.price_to_beat is None:
-            logger.debug("窗口 %d 无开盘价，跳过", window_ts)
             return None
 
-        # 2. 时间检查：只在入场窗口内操作
         elapsed = seconds_elapsed if seconds_elapsed is not None else (int(time.time()) - window_ts)
         secs_remaining = 300 - elapsed
-        if not (cfg.entry_window_start <= elapsed <= cfg.entry_window_end):
-            return None
+        minute = elapsed // 60
 
-        # 3. 本窗口已下单，不重复操作
+        # ── 本窗口已下单，不重复 ──
         if state.already_traded:
-            logger.debug("窗口 %d 本轮已下单(%s)，跳过重复评估", window_ts, state.trade_direction)
             return None
 
-        # 4. 市场状态检查
+        # ── 市场状态 ──
         if market.closed or not market.active:
-            logger.warning("窗口 %d 市场状态异常: closed=%s active=%s", window_ts, market.closed, market.active)
             return None
 
-        # 5. 计算 gap
-        gap_pct = (btc_price - state.price_to_beat) / state.price_to_beat * 100
-
-        if abs(gap_pct) < cfg.min_gap_pct:
-            logger.debug(
-                "窗口 %d gap 不足: |%.4f%%| < %.2f%%  BTC=$%.2f PtB=$%.2f  elapsed=%ds",
-                window_ts, gap_pct, cfg.min_gap_pct, btc_price, state.price_to_beat, elapsed,
-            )
+        # ── PtB 延迟过大 ──
+        if ptb_delay_secs > 60:
+            logger.debug("PtB延迟 %ds，基准失真，仅赔率跳变信号有效", ptb_delay_secs)
             return None
 
-        # 6. 方向和赔率
-        if gap_pct > 0:
-            direction = Direction.UP
-            market_price = market.up_odds
-            token_id = market.up_token
-            opposite_odds = market.down_odds
+        # ── 选择最可靠的 gap ──
+        cl_fresh = (cl_age is not None and cl_age < CL_FRESH_SECS)
+        if cl_fresh and cl_gap is not None:
+            gap     = cl_gap
+            gap_src = "CL链上"
         else:
-            direction = Direction.DOWN
-            market_price = market.down_odds
-            token_id = market.down_token
-            opposite_odds = market.up_odds
+            gap     = (btc_price - state.price_to_beat) / state.price_to_beat * 100
+            gap_src = "BN"
 
-        # ── 关键验证：方向一致性检查 ──
-        # 问题根源：我们用 Binance PtB，Polymarket 用 Chainlink PtB，两者可能不同。
-        # 若市场赔率显示"对立方向"的概率 > 0.60，说明 Chainlink 判断与我们相反，
-        # 此时绝对不能下注（如 15:34 BTC Binance下跌但市场 Up=0.86 的情形）。
-        if opposite_odds > 0.60:
-            logger.warning(
-                "⛔ 方向冲突！Binance信号=%s(gap=%+.3f%%) 但市场认为对立方向概率=%.2f "
-                "——Chainlink与Binance价格可能存在偏差，跳过",
-                direction.value, gap_pct, opposite_odds,
-            )
+        up_odds   = market.up_odds
+        down_odds = market.down_odds
+        _bn_gap   = bn_gap if bn_gap is not None else gap
+
+        # ── 软冲突检查（gap 方向 vs 赔率方向） ──
+        if abs(gap) >= 0.05 and minute >= 2:
+            signal_up = gap > 0
+            opp_odds  = up_odds if not signal_up else down_odds
+            soft_thr  = 0.58 if state.odds_jumped else 0.65
+            if opp_odds > soft_thr:
+                logger.info(
+                    "⚠️ 软冲突: gap→%s 但对立赔率=%.2f>%.2f [%s]",
+                    "UP" if signal_up else "DOWN", opp_odds, soft_thr,
+                    "已跳变" if state.odds_jumped else "静止偏置",
+                )
+                return None
+
+        # ── 强冲突检查（gap ≥ 0.05% + 强势赔率方向相反） ──
+        if abs(gap) >= 0.05 and minute >= 3:
+            gap_up       = gap > 0
+            mkt_up_dom   = up_odds   > 0.60
+            mkt_dn_dom   = down_odds > 0.60
+            if (gap_up and mkt_dn_dom) or (not gap_up and mkt_up_dom):
+                mkt_dir   = "UP"   if mkt_up_dom else "DOWN"
+                mkt_price = up_odds if mkt_up_dom else down_odds
+
+                # BN gap 反向确认：两种数据源都说赔率方向是对的
+                bn_counter = (
+                    (mkt_dir == "DOWN" and _bn_gap > BN_COUNTER_THRESH) or
+                    (mkt_dir == "UP"   and _bn_gap < -BN_COUNTER_THRESH)
+                )
+                if bn_counter:
+                    logger.info("⚠️ 赔率存疑: gap→%s 但BN也显示%s方向反向",
+                                "UP" if gap_up else "DOWN", mkt_dir)
+                    return None
+
+                # 赔率强度不足：中等确信不操作
+                if mkt_price < STRONG_ODDS_THRESH:
+                    logger.debug("赔率不够强: %s=%.2f < %.2f", mkt_dir, mkt_price, STRONG_ODDS_THRESH)
+                    return None
+
+                # 赔率强确认：以赔率方向为准
+                theo_wr = 0.897 if mkt_price < 0.85 else 0.968
+                direction = Direction.UP if mkt_up_dom else Direction.DOWN
+                token_id  = market.up_token if mkt_up_dom else market.down_token
+                ev = theo_wr * (1 - mkt_price) - (1 - theo_wr) * mkt_price
+                fee_frac = 0.25 * (mkt_price * (1 - mkt_price)) ** 2
+                ev_fee   = ev - theo_wr * fee_frac
+                if ev > cfg.min_ev_threshold:
+                    kelly = self._kelly(theo_wr, mkt_price)
+                    return Signal(
+                        direction=direction, token_id=token_id,
+                        theoretical_win_rate=theo_wr, market_price=mkt_price,
+                        ev_per_unit=ev, ev_after_fee=ev_fee, gap_pct=gap, gap_src=gap_src,
+                        seconds_remaining=secs_remaining, kelly_fraction=kelly,
+                        bet_amount=self.total_capital * kelly, signal_type="跟赔率",
+                        note=f"赔率{mkt_dir}={mkt_price:.2f}强确认（gap反向以赔率为准）",
+                    )
+                return None
+
+        # ── 末期套利核心逻辑 ──
+        gap_abs = abs(gap)
+        theo_wr = self._theo_win_rate(gap_abs, minute)
+        if theo_wr < 0.85:
             return None
 
-        # 7. 理论胜率
-        minute_in_window = elapsed // 60
-        theo_wr = cfg.theoretical_win_rate(abs(gap_pct), minute_in_window)
+        direction    = Direction.UP if gap > 0 else Direction.DOWN
+        market_price = up_odds if gap > 0 else down_odds
+        token_id     = market.up_token if gap > 0 else market.down_token
 
-        # 动态调整：根据订单簿深度修正胜率（可选）
+        # 安全边际
+        edge = theo_wr - market_price
+        if edge < cfg.entry_margin:
+            logger.debug("边际不足 %s edge=%.4f < %.2f", direction.value, edge, cfg.entry_margin)
+            return None
+
+        ev       = theo_wr * (1 - market_price) - (1 - theo_wr) * market_price
+        fee_frac = 0.25 * (market_price * (1 - market_price)) ** 2
+        ev_fee   = ev - theo_wr * fee_frac
+
+        if ev < cfg.min_ev_threshold:
+            return None
+
+        # 订单簿流动性调整
         if orderbook is not None:
             theo_wr = self._adjust_for_orderbook(theo_wr, direction, market_price, orderbook)
 
-        # 8. 安全边际检查
-        edge = theo_wr - market_price
-        if edge < cfg.entry_margin:
-            logger.info(
-                "⚪ 边际不足 窗口%d | %s gap=%+.3f%% TWR=%.1f%% mkt=%.3f edge=%.4f < %.2f",
-                window_ts, direction.value, gap_pct, theo_wr * 100, market_price, edge, cfg.entry_margin,
-            )
-            return None
+        kelly  = self._kelly(theo_wr, market_price)
+        bet    = self.total_capital * kelly
 
-        # 9. 期望收益
-        ev = theo_wr * (1 - market_price) - (1 - theo_wr) * market_price
-
-        # 10. Kelly 仓位
-        kelly_frac = self._kelly(theo_wr, market_price)
-        bet = self.total_capital * kelly_frac
-
+        sig_type = "末期套利" if gap_abs >= 0.10 else "弱套利"
         signal = Signal(
-            direction=direction,
-            token_id=token_id,
-            theoretical_win_rate=theo_wr,
-            market_price=market_price,
-            ev_per_unit=ev,
-            gap_pct=gap_pct,
-            seconds_remaining=secs_remaining,
-            kelly_fraction=kelly_frac,
-            bet_amount=bet,
+            direction=direction, token_id=token_id,
+            theoretical_win_rate=theo_wr, market_price=market_price,
+            ev_per_unit=ev, ev_after_fee=ev_fee, gap_pct=gap, gap_src=gap_src,
+            seconds_remaining=secs_remaining, kelly_fraction=kelly,
+            bet_amount=bet, signal_type=sig_type,
         )
 
         if signal.is_valid:
-            logger.info("🟢 套利信号: %s", signal.summary())
-        else:
-            logger.debug("信号无效 (EV=%.4f): %s", ev, signal.summary())
-
-        return signal
+            logger.info("🟢 %s 信号: %s", sig_type, signal.summary())
+        return signal if signal.is_valid else None
 
     def mark_traded(self, window_ts: int, direction: Direction):
         state = self.get_window_state(window_ts)
-        state.already_traded = True
-        state.trade_direction = direction
+        state.already_traded   = True
+        state.trade_direction  = direction
 
     def update_capital(self, new_capital: float):
         self.total_capital = new_capital
@@ -221,97 +283,79 @@ class LateStageArbitrageStrategy:
     # ── 内部计算 ──
 
     @staticmethod
+    def _theo_win_rate(gap_abs: float, minute: int) -> float:
+        """理论胜率查表（与 collect_data.py 严格同步）"""
+        if minute < 3:
+            return 0.5
+        if gap_abs >= 0.30: return 0.995
+        if gap_abs >= 0.20: return 0.982
+        if gap_abs >= 0.15: return 0.979
+        if gap_abs >= 0.10: return 0.968
+        if gap_abs >= 0.05: return 0.897
+        return 0.5
+
+    @staticmethod
     def _kelly(win_rate: float, entry_price: float) -> float:
-        """
-        Kelly 公式（半 Kelly，上限 max_bet_fraction）
-        b = (1 - entry) / entry  （每单位投入的净盈利倍数）
-        Kelly = (b * p - q) / b
-        """
+        """半 Kelly，上限 max_bet_fraction"""
         b = (1 - entry_price) / entry_price
         if b <= 0:
             return 0.0
-        q = 1 - win_rate
-        kelly = (b * win_rate - q) / b
-        half_kelly = kelly * 0.5
-        return max(0.0, min(half_kelly, cfg.max_bet_fraction))
+        kelly = (b * win_rate - (1 - win_rate)) / b
+        return max(0.0, min(kelly * 0.5, cfg.max_bet_fraction))
 
     @staticmethod
     def _adjust_for_orderbook(
-        theo_wr: float,
-        direction: Direction,
-        market_price: float,
-        ob: OrderBook,
+        theo_wr: float, direction: Direction,
+        market_price: float, ob: OrderBook,
     ) -> float:
-        """
-        根据订单簿深度微调理论胜率：
-        - 如果 asks 在 market_price 附近几乎没有流动性，可能需要更高的价格成交，降低吸引力
-        - 如果深度充足，维持原理论胜率
-        """
         depth = ob.ask_depth_at(market_price + 0.02)
-        if depth < 10:  # 流动性不足 $10
+        if depth < 10:
             logger.debug("订单簿深度不足 (%.1f)，下调理论胜率", depth)
             return theo_wr * 0.98
         return theo_wr
 
 
 # ─────────────────────────────────────────────
-# 风险控制器
+# 风险控制器（不变）
 # ─────────────────────────────────────────────
 
 class RiskManager:
-    """
-    全局风险控制，独立于策略逻辑之外。
-    负责：日亏损限额、连续亏损熔断、资金更新。
-    """
-
     def __init__(self, initial_capital: float):
-        self.initial_capital = initial_capital
-        self.current_capital = initial_capital
+        self.initial_capital    = initial_capital
+        self.current_capital    = initial_capital
         self._day_start_capital = initial_capital
-        self._day_start_ts = self._today_ts()
+        self._day_start_ts      = self._today_ts()
         self._consecutive_losses = 0
         self._paused_until: float = 0.0
         self._total_trades = 0
-        self._total_wins = 0
+        self._total_wins   = 0
 
     def allow_trade(self) -> tuple[bool, str]:
-        """
-        返回 (是否允许交易, 原因)
-        """
         now = time.time()
-
-        # 暂停检查
         if now < self._paused_until:
             remaining = int(self._paused_until - now)
             return False, f"连续亏损熔断，剩余暂停 {remaining}s"
-
-        # 日亏损限额
         self._refresh_day()
         day_loss = (self._day_start_capital - self.current_capital) / self._day_start_capital
         if day_loss >= cfg.max_daily_loss_fraction:
-            return False, f"日亏损 {day_loss:.1%} 已达上限 {cfg.max_daily_loss_fraction:.0%}"
-
-        # 资金最低保护（不到初始资金 10%）
+            return False, f"日亏损 {day_loss:.1%} 已达上限"
         if self.current_capital < self.initial_capital * 0.10:
             return False, "资金不足初始的 10%，停止交易"
-
         return True, "ok"
 
     def record_result(self, win: bool, pnl: float):
         self.current_capital += pnl
-        self._total_trades += 1
+        self._total_trades   += 1
         if win:
-            self._total_wins += 1
-            self._consecutive_losses = 0
+            self._total_wins         += 1
+            self._consecutive_losses  = 0
         else:
             self._consecutive_losses += 1
             if self._consecutive_losses >= cfg.max_consecutive_losses:
                 pause_secs = cfg.pause_after_loss_minutes * 60
                 self._paused_until = time.time() + pause_secs
-                logger.warning(
-                    "连续亏损 %d 次！暂停 %d 分钟",
-                    self._consecutive_losses, cfg.pause_after_loss_minutes
-                )
+                logger.warning("连续亏损 %d 次！暂停 %d 分钟",
+                               self._consecutive_losses, cfg.pause_after_loss_minutes)
 
     @property
     def win_rate(self) -> float:
@@ -321,20 +365,20 @@ class RiskManager:
     def stats(self) -> dict:
         pnl = self.current_capital - self.initial_capital
         return {
-            "capital":    self.current_capital,
-            "pnl":        pnl,
-            "pnl_pct":    pnl / self.initial_capital,
-            "trades":     self._total_trades,
-            "wins":       self._total_wins,
-            "win_rate":   self.win_rate,
-            "cons_loss":  self._consecutive_losses,
+            "capital":   self.current_capital,
+            "pnl":       pnl,
+            "pnl_pct":   pnl / self.initial_capital,
+            "trades":    self._total_trades,
+            "wins":      self._total_wins,
+            "win_rate":  self.win_rate,
+            "cons_loss": self._consecutive_losses,
         }
 
     def _refresh_day(self):
         today = self._today_ts()
         if today > self._day_start_ts:
             self._day_start_capital = self.current_capital
-            self._day_start_ts = today
+            self._day_start_ts      = today
 
     @staticmethod
     def _today_ts() -> int:
