@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +35,24 @@ try:
     load_dotenv(_env_path)
 except ImportError:
     pass
+
+# 历史背景模块
+sys.path.insert(0, str(Path(__file__).parent))
+try:
+    from market_context import MarketContext
+    _HAS_MARKET_CONTEXT = True
+except ImportError:
+    _HAS_MARKET_CONTEXT = False
+    print("  [警告] market_context 模块未找到，历史背景功能禁用")
+
+
+def _extract_direction(signal: str) -> str | None:
+    """从信号字符串中提取方向（用于历史背景评分）。"""
+    if "方向=UP" in signal:
+        return "UP"
+    if "方向=DOWN" in signal:
+        return "DOWN"
+    return None
 
 # ────────────────────────────────────────────────────────────
 DB_PATH      = "observations.db"
@@ -132,6 +151,14 @@ def init_db():
         ("cl_onchain_age",     "INTEGER"),
         ("bn_gap_pct",         "REAL"),
         ("cl_onchain_gap_pct", "REAL"),
+        # Phase 2：历史背景字段
+        ("trend_30m",          "REAL"),
+        ("trend_90m",          "REAL"),
+        ("atr_30m",            "REAL"),
+        ("vol_ratio",          "REAL"),
+        ("price_5m_ago",       "REAL"),
+        ("price_30m_ago",      "REAL"),
+        ("signal_aligned",     "INTEGER"),
     ]
     existing = {row[1] for row in conn.execute("PRAGMA table_info(observations)")}
     for col, typ in migrations:
@@ -264,14 +291,18 @@ def log_observation(conn: sqlite3.Connection, obs: dict):
          btc_price, cc_price, cl_onchain_price, cl_onchain_age,
          price_to_beat,
          gap_pct, bn_gap_pct, cl_onchain_gap_pct,
-         up_odds, down_odds, volume, condition_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         up_odds, down_odds, volume, condition_id,
+         trend_30m, trend_90m, atr_30m, vol_ratio,
+         price_5m_ago, price_30m_ago, signal_aligned)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         obs["ts"], obs["window_ts"], obs["minute_in_window"],
         obs["btc_price"], obs.get("cc_price"), obs.get("cl_onchain_price"), obs.get("cl_onchain_age"),
         obs["price_to_beat"],
         obs["gap_pct"], obs.get("bn_gap_pct"), obs.get("cl_onchain_gap_pct"),
         obs["up_odds"], obs["down_odds"], obs["volume"], obs["condition_id"],
+        obs.get("trend_30m"), obs.get("trend_90m"), obs.get("atr_30m"), obs.get("vol_ratio"),
+        obs.get("price_5m_ago"), obs.get("price_30m_ago"), obs.get("signal_aligned"),
     ))
     conn.commit()
 
@@ -422,10 +453,17 @@ async def main():
     print("Polymarket BTC 5m 数据采集器")
     print("价格源: Chainlink链上(主) > CryptoCompare(次) > Binance(辅)")
     print("赔率源: CLOB 实时订单簿(每5s) > Gamma API 初始值(仅备用)")
+    if _HAS_MARKET_CONTEXT:
+        print("历史背景: 开窗时拉取 Binance 90m K线（趋势/波动率辅助评分）")
     print("按 Ctrl+C 停止")
     print("=" * 65)
 
     conn = init_db()
+
+    # 历史背景模块（Phase 2）
+    mc: MarketContext | None = (
+        MarketContext(session=get_session()) if _HAS_MARKET_CONTEXT else None
+    )
 
     token_cache:     dict[int, dict]   = {}   # Gamma API 静态 token 信息（每窗口一次）
     bn_ptb_cache:    dict[int, float]  = {}   # Binance 开盘价
@@ -489,6 +527,10 @@ async def main():
                 clob_odds_history  = []
                 last_clob_up       = None
                 last_clob_dn       = None
+                # 窗口开盘时强制刷新历史K线（异步场景用 asyncio.to_thread 会更好，
+                # 但K线请求 < 500ms，直接同步调用对 poll 延迟影响可忽略）
+                if mc is not None:
+                    mc.refresh(force=True)
 
             # ── 记录开盘 PtB（优先 Chainlink链上 > CC > Binance）──
             if window_ts not in bn_ptb_cache:
@@ -573,6 +615,9 @@ async def main():
             # 记录本窗口历史（用于静止检测）
             clob_odds_history.append(clob_up)
 
+            # 历史背景（每 poll 复用已有缓存，无额外网络请求）
+            ctx_data: dict | None = mc.get_context() if mc is not None else None
+
             obs = {
                 "ts":                now,
                 "window_ts":         window_ts,
@@ -589,6 +634,14 @@ async def main():
                 "down_odds":         clob_dn,
                 "volume":            tkn["volume"],
                 "condition_id":      tkn["condition_id"],
+                # Phase 2 历史背景（无数据时为 None，DB 允许 NULL）
+                "trend_30m":         ctx_data["trend_30m"]     if ctx_data else None,
+                "trend_90m":         ctx_data["trend_90m"]     if ctx_data else None,
+                "atr_30m":           ctx_data["atr_30m"]       if ctx_data else None,
+                "vol_ratio":         ctx_data["vol_ratio"]     if ctx_data else None,
+                "price_5m_ago":      ctx_data["price_5m_ago"]  if ctx_data else None,
+                "price_30m_ago":     ctx_data["price_30m_ago"] if ctx_data else None,
+                "signal_aligned":    None,   # 待信号确定后更新
             }
 
             log_observation(conn, obs)
@@ -637,6 +690,25 @@ async def main():
                 cl_age=cl_age,
             )
 
+            # ── Phase 2：历史背景评分（仅附加信息，不改变核心信号）──
+            ctx_tag = ""
+            if mc is not None and ctx_data is not None:
+                direction = _extract_direction(signal)
+                if direction:
+                    conf = mc.signal_confidence(direction, primary_gap, minute)
+                    # 更新 signal_aligned（有方向信号时才有意义）
+                    aligned = conf["trend_aligned"]
+                    obs["signal_aligned"] = (
+                        1 if aligned is True else
+                        0 if aligned is False else
+                        None
+                    )
+                    # 构建标签：有强套利/弱套利信号时显示，无信号时只记录不显示
+                    if "🟢" in signal or "🟡" in signal:
+                        rec = conf["recommended_gap_threshold"]
+                        rec_str = f" 建议gap≥{rec:.2f}%" if rec > 0.05 else ""
+                        ctx_tag = f" [{conf['note']} 可信={conf['score']:.2f}{rec_str}]"
+
             # ── 日志格式：优先展示 Chainlink 链上 gap ──
             gap_arrow = "↑" if primary_gap > 0 else ("↓" if primary_gap < 0 else "─")
 
@@ -660,7 +732,7 @@ async def main():
                 f"[{ts_str}] 分{minute} | "
                 f"BTC=${btc_price:,.1f} {cl_status} {gap_str} | "
                 f"Up={clob_up:.2f} Down={clob_dn:.2f} | "
-                f"{signal}{odds_jump_signal}{odds_static_warn}"
+                f"{signal}{ctx_tag}{odds_jump_signal}{odds_static_warn}"
             )
 
             await asyncio.sleep(POLL_INTERVAL)
