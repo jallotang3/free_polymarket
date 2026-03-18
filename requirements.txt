@@ -7,3 +7,4 @@ eth-account>=0.10.0
 apscheduler>=3.10.0
 requests>=2.31.0
 PySocks>=1.7.1
+polymarket-apis>=0.5.2   # 自动兑换（官方SDK无此功能，Issue #139）

@@ -38,6 +38,7 @@ from src.data_feed import (
 from src.strategy import Direction, LateStageArbitrageStrategy, RiskManager
 from src.executor import TradeDB, TradeRecord, make_executor
 from src.monitor import dashboard, notifier, setup_logging
+from src.redeemer import AutoRedeemer
 
 # 历史背景模块（可选）
 try:
@@ -76,6 +77,13 @@ class PolymarketBot:
 
         # 历史背景模块（Phase 2）
         self.mc: Optional[MarketContext] = MarketContext() if _HAS_MC else None
+
+        # 自动兑换模块
+        self.redeemer = AutoRedeemer(
+            private_key    = cfg.private_key,
+            wallet_address = cfg.wallet_address,
+            signature_type = 0,   # EOA
+        )
 
         # 状态
         self._open_trades:   dict[int, TradeRecord] = {}
@@ -325,7 +333,8 @@ class PolymarketBot:
     # ── 结算循环 ──────────────────────────────────────
 
     async def _settlement_loop(self):
-        _hb = 0
+        _hb            = 0
+        _last_redeem_t = 0
         while self._running:
             await asyncio.sleep(30)
             _hb += 1
@@ -333,6 +342,13 @@ class PolymarketBot:
                 logger.debug("结算检查 | 待结算=%d | PnL=%+.2f",
                              len(self._open_trades), self.risk.stats["pnl"])
             await self._settle_closed_windows()
+
+            # 每5分钟扫描一次全部可兑换仓位（兜底，防止漏兑换）
+            now = int(time.time())
+            if self.redeemer.available and now - _last_redeem_t >= 300:
+                _last_redeem_t = now
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self.redeemer.redeem_all)
 
     async def _settle_closed_windows(self):
         now = int(time.time())
@@ -364,6 +380,23 @@ class PolymarketBot:
                 self.mode, trade.direction, result,
                 pnl, self.risk.win_rate, self.risk.stats["pnl"],
             ))
+
+            # ── 自动兑换（实盘模式 + 赢单 + redeemer 可用）──
+            if win and self.mode == "live" and self.redeemer.available:
+                outcome_index = 0 if result == "Up" else 1
+                condition_id  = getattr(trade, "condition_id", None) or market.condition_id
+                size          = getattr(trade, "size", 0.0)
+                neg_risk      = getattr(market, "neg_risk", False)
+                logger.info("触发自动兑换: condition=%s outcome=%d size=%.4f",
+                            condition_id[:12] + "…", outcome_index, size)
+                redeem_result = await loop.run_in_executor(
+                    None, self.redeemer.redeem_one,
+                    condition_id, outcome_index, size, neg_risk,
+                )
+                if redeem_result.success:
+                    logger.info("✅ 自动兑换成功 tx=%s", str(redeem_result.tx_hash)[:20] + "…")
+                else:
+                    logger.warning("⚠️ 自动兑换失败（已加入待兑换队列）: %s", redeem_result.error)
 
     # ── 辅助方法 ─────────────────────────────────────
 
