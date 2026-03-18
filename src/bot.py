@@ -6,6 +6,11 @@
   python -m src.bot --mode paper  # 纸面交易
   python -m src.bot --mode live   # 实盘（需配置钱包）
   python -m src.bot --capital 500 # 指定初始资金（paper 专用）
+
+信号路径：
+  路径1（跟赔率）  ：gap ≥ 0.05% + minute ≥ 3 + gap 与赔率反向 → 赔率主导
+  路径2（赔率强信号）：gap < 0.05% + 赔率单边 ≥ 0.72 + 分层时机 + 历史可信度过滤
+  路径3（末期套利）  ：gap ≥ 0.10% + minute ≥ 3 → 理论胜率查表
 """
 
 import argparse
@@ -53,7 +58,7 @@ CL_FRESH_SECS = 45   # Chainlink 链上价格新鲜阈值（秒）
 
 class PolymarketBot:
     def __init__(self, mode: str, initial_capital: float):
-        self.mode           = mode
+        self.mode            = mode
         self.initial_capital = initial_capital
 
         # 数据层
@@ -70,7 +75,7 @@ class PolymarketBot:
         self.executor = make_executor(mode, self.db)
 
         # 历史背景模块（Phase 2）
-        self.mc = MarketContext() if _HAS_MC else None
+        self.mc: Optional[MarketContext] = MarketContext() if _HAS_MC else None
 
         # 状态
         self._open_trades:   dict[int, TradeRecord] = {}
@@ -81,10 +86,10 @@ class PolymarketBot:
         # 价格状态（跨 tick 共享）
         self._cl_last_price:     Optional[float] = None
         self._cl_last_oracle_ts: Optional[int]   = None
-        self._cl_ptb_cache:      dict[int, float] = {}   # window_ts → CL PtB
-        self._cc_ptb_cache:      dict[int, float] = {}   # window_ts → CC PtB
-        self._bn_ptb_cache:      dict[int, float] = {}   # window_ts → BN PtB
-        self._ptb_delay_cache:   dict[int, int]   = {}   # window_ts → 延迟秒数
+        self._cl_ptb_cache:      dict[int, float] = {}
+        self._cc_ptb_cache:      dict[int, float] = {}
+        self._bn_ptb_cache:      dict[int, float] = {}
+        self._ptb_delay_cache:   dict[int, int]   = {}
 
         # CLOB 实时赔率状态
         self._last_clob_up: Optional[float] = None
@@ -136,10 +141,11 @@ class PolymarketBot:
         now       = int(time.time())
         window_ts = current_window_ts()
         elapsed   = seconds_into_window()
+        minute    = elapsed // 60
         ts_str    = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
         # ── 1. BTC 价格（三源） ──
-        loop     = asyncio.get_event_loop()
+        loop      = asyncio.get_event_loop()
         btc_price = self.price_feed.price or await self.price_cache.get_async()
         if btc_price is None:
             logger.warning("[%s] 无法获取 BTC 价格，跳过", ts_str)
@@ -169,17 +175,21 @@ class PolymarketBot:
             self._last_clob_dn   = None
 
         # ── 3. 三源 gap 计算 ──
-        bn_ptb  = self._bn_ptb_cache.get(window_ts, btc_price)
-        cc_ptb  = self._cc_ptb_cache.get(window_ts, cc_price or btc_price)
-        cl_ptb  = self._cl_ptb_cache.get(window_ts)
+        bn_ptb = self._bn_ptb_cache.get(window_ts, btc_price)
+        cc_ptb = self._cc_ptb_cache.get(window_ts, cc_price or btc_price)
+        cl_ptb = self._cl_ptb_cache.get(window_ts)
 
         bn_gap_pct = (btc_price - bn_ptb) / bn_ptb * 100
         cc_gap_pct = ((cc_price - cc_ptb) / cc_ptb * 100) if cc_price and cc_ptb else bn_gap_pct
         cl_gap_pct = None
-        if cl_price and cl_ptb and cl_fresh:
-            cl_gap_pct = (cl_price - cl_ptb) / cl_ptb * 100
-        elif cl_price and cc_ptb and cl_fresh:
-            cl_gap_pct = (cl_price - cc_ptb) / cc_ptb * 100
+        if cl_price and cl_fresh:
+            ref_ptb = cl_ptb or cc_ptb
+            if ref_ptb:
+                cl_gap_pct = (cl_price - ref_ptb) / ref_ptb * 100
+
+        # 主 gap 优先级：CL链上(新鲜) > CC > BN
+        primary_gap = (cl_gap_pct if cl_gap_pct is not None and cl_fresh
+                       else cc_gap_pct if cc_price else bn_gap_pct)
 
         # ── 4. Gamma 静态信息（每窗口一次） ──
         market = await self._get_market(window_ts)
@@ -201,37 +211,57 @@ class PolymarketBot:
 
         market.update_clob_odds(clob_up, clob_dn)
 
-        # 赔率跳变检测（用于动态软冲突阈值）
+        # 赔率跳变检测
         self.strategy.update_odds_history(window_ts, clob_up)
 
         # ── 6. 同步资金 ──
         self.strategy.update_capital(self.risk.current_capital)
 
-        # ── 7. 心跳日志 ──
-        primary_gap = cl_gap_pct if cl_gap_pct is not None and cl_fresh else cc_gap_pct
-        cl_tag = f"CL=${cl_price:,.0f}({cl_age}s)" if cl_price else "CL=N/A"
+        # ── 7. 预计算历史背景置信度（供路径2早期拦截使用）──
+        mc_conf_up  = 1.0
+        mc_conf_dn  = 1.0
+        mc_ctx_note = ""
+        if self.mc is not None:
+            try:
+                res_up     = self.mc.signal_confidence("UP",   primary_gap, minute)
+                res_dn     = self.mc.signal_confidence("DOWN", primary_gap, minute)
+                mc_conf_up = res_up["score"]
+                mc_conf_dn = res_dn["score"]
+                # 心跳日志用：取赔率主导方向的上下文
+                dominant_note_dir = "UP" if clob_up >= clob_dn else "DOWN"
+                dominant_res  = res_up if dominant_note_dir == "UP" else res_dn
+                mc_ctx_note   = (f" [{dominant_res['note']} 可信={dominant_res['score']:.2f}]"
+                                 if dominant_res.get("note") else "")
+            except Exception as e:
+                logger.debug("MarketContext 置信度计算失败: %s", e)
+
+        # ── 8. 心跳日志 ──
         gap_arrow = "↑" if primary_gap > 0 else ("↓" if primary_gap < 0 else "─")
-        gap_str   = f"{gap_arrow}{primary_gap:+.3f}%"
+        gap_src   = "CL" if cl_gap_pct is not None and cl_fresh else "CC" if cc_price else "BN"
+        cl_tag    = f"CL=${cl_price:,.0f}({cl_age}s)" if cl_price else "CL=N/A"
         logger.info(
-            "[%s] 分%d | BTC=$%.1f %s %s | Up=%.2f Down=%.2f | cap=$%.2f",
-            ts_str, elapsed // 60, btc_price, cl_tag, gap_str,
+            "[%s] 分%d | BTC=$%.1f %s %s%+.3f%%(%s) | Up=%.2f Down=%.2f | cap=$%.2f%s",
+            ts_str, minute, btc_price, cl_tag,
+            gap_arrow, primary_gap, gap_src,
             clob_up, clob_dn, self.risk.current_capital,
+            mc_ctx_note,
         )
 
         dashboard.maybe_print(btc_price, primary_gap, window_ts,
                               self.risk.current_capital, self.risk.stats, self.mode)
 
-        # ── 8. 入场窗口检查 ──
+        # ── 9. 入场窗口检查 ──
+        # entry_window_start=60(分1)，策略内部对各路径有独立时机约束
         if not (cfg.entry_window_start <= elapsed <= cfg.entry_window_end):
             return
 
-        # ── 9. 风控检查 ──
+        # ── 10. 风控检查 ──
         allowed, reason = self.risk.allow_trade()
         if not allowed:
             logger.warning("风控拦截: %s", reason)
             return
 
-        # ── 10. 评估信号 ──
+        # ── 11. 订单簿（仅路径3大gap时需要） ──
         orderbook = None
         if abs(primary_gap) >= cfg.min_gap_pct:
             direction_token = market.up_token if primary_gap > 0 else market.down_token
@@ -239,28 +269,41 @@ class PolymarketBot:
 
         ptb_delay = self._ptb_delay_cache.get(window_ts, 0)
 
+        # 取赔率主导方向的置信度传入策略（路径2用于早期分钟拦截）
+        dominant_dir       = "UP" if clob_up >= clob_dn else "DOWN"
+        signal_confidence  = mc_conf_up if dominant_dir == "UP" else mc_conf_dn
+
+        # ── 12. 评估信号 ──
         signal = self.strategy.evaluate(
-            window_ts      = window_ts,
-            btc_price      = btc_price,
-            market         = market,
-            orderbook      = orderbook,
-            seconds_elapsed = elapsed,
-            cl_gap         = cl_gap_pct,
-            cl_age         = cl_age,
-            bn_gap         = bn_gap_pct,
-            ptb_delay_secs = ptb_delay,
+            window_ts          = window_ts,
+            btc_price          = btc_price,
+            market             = market,
+            orderbook          = orderbook,
+            seconds_elapsed    = elapsed,
+            cl_gap             = cl_gap_pct,
+            cl_age             = cl_age,
+            bn_gap             = bn_gap_pct,
+            ptb_delay_secs     = ptb_delay,
+            signal_confidence  = signal_confidence,
         )
 
         if signal is None or not signal.is_valid:
             return
 
-        # ── 历史背景评分（信息性，不阻止下单） ──
+        # 附加精确上下文标签到 signal.note（信息性）
         if self.mc is not None:
-            conf = self.mc.signal_confidence(signal.direction.value, primary_gap, elapsed // 60)
-            if conf["note"]:
-                signal.note = conf["note"] + f" 可信={conf['score']:.2f}"
+            try:
+                conf = self.mc.signal_confidence(
+                    signal.direction.value, primary_gap, minute
+                )
+                rec  = conf.get("recommended_gap_threshold", 0)
+                rec_str  = f" 建议gap≥{rec:.2f}%" if rec > 0.05 else ""
+                note_tag = f"[{conf['note']} 可信={conf['score']:.2f}{rec_str}]"
+                signal.note = (signal.note + " " + note_tag).strip()
+            except Exception:
+                pass
 
-        # ── 11. 执行下单 ──
+        # ── 13. 执行下单 ──
         trade = await self.executor.place(signal, window_ts)
         if trade is None:
             logger.error("下单失败")
@@ -268,6 +311,12 @@ class PolymarketBot:
 
         self._open_trades[window_ts] = trade
         self.strategy.mark_traded(window_ts, signal.direction)
+        logger.info(
+            "✅ 下单成功 | %s | bet=$%.2f | 赔率=%.3f | EV=%+.3f | gap=%+.3f%%(%s) | %s",
+            signal.direction.value, signal.bet_amount,
+            signal.market_price, signal.ev_per_unit,
+            signal.gap_pct, signal.gap_src, signal.note,
+        )
         notifier.notify(notifier.trade_opened(
             self.mode, signal.direction.value, signal.bet_amount,
             signal.market_price, signal.ev_per_unit, signal.gap_pct,
@@ -298,12 +347,19 @@ class PolymarketBot:
                 self._open_trades[wts] = trade  # 放回重试
                 continue
 
-            result = ("Up"   if market.gamma_up   >= 0.99 else
-                      "Down" if market.gamma_dn    >= 0.99 else
-                      "Up"   if market.gamma_up    >  0.5  else "Down")
+            result = ("Up"   if market.gamma_up >= 0.99 else
+                      "Down" if market.gamma_dn >= 0.99 else
+                      "Up"   if market.gamma_up >  0.5  else "Down")
 
             pnl = await self.executor.settle(trade, result)
-            self.risk.record_result(result == trade.direction, pnl)
+            win = (result == trade.direction)
+            self.risk.record_result(win, pnl)
+            logger.info(
+                "%s 结算 | %s → %s | PnL=%+.2f | 胜率=%.1f%% | 总PnL=%+.2f",
+                "✅" if win else "❌",
+                trade.direction, result, pnl,
+                self.risk.win_rate * 100, self.risk.stats["pnl"],
+            )
             notifier.notify(notifier.trade_settled(
                 self.mode, trade.direction, result,
                 pnl, self.risk.win_rate, self.risk.stats["pnl"],
@@ -324,14 +380,11 @@ class PolymarketBot:
         self._ptb_delay_cache[window_ts] = elapsed
 
         if cl_price and cl_fresh:
-            ptb     = cl_price
-            ptb_src = f"CL链上PtB=${cl_price:,.2f}"
+            ptb, ptb_src = cl_price, f"CL链上PtB=${cl_price:,.2f}"
         elif cc_price:
-            ptb     = cc_price
-            ptb_src = f"CC估算PtB=${cc_price:,.2f}"
+            ptb, ptb_src = cc_price, f"CC估算PtB=${cc_price:,.2f}"
         else:
-            ptb     = btc_price
-            ptb_src = f"BN估算PtB=${btc_price:,.2f}"
+            ptb, ptb_src = btc_price, f"BN估算PtB=${btc_price:,.2f}"
 
         quality = ("精确" if elapsed <= cfg.poll_interval_secs else
                    f"轻微延迟({elapsed}s)" if elapsed <= 30 else
@@ -339,15 +392,14 @@ class PolymarketBot:
         logger.info("── 新窗口 ts=%d  %s  [%s]  资金=$%.2f ──",
                     window_ts, ptb_src, quality, self.risk.current_capital)
 
-        # 策略层更新 PtB
         self.strategy.set_price_to_beat(window_ts, ptb)
 
-        # 历史背景预取（异步）
+        # 历史背景预取（异步，不阻塞主循环）
         if self.mc is not None:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self.mc.refresh, True)
 
-        # 清理旧缓存
+        # 清理旧缓存（保留最近 2 个窗口）
         old = window_ts - 600
         for cache in (self._bn_ptb_cache, self._cc_ptb_cache,
                       self._cl_ptb_cache, self._ptb_delay_cache):
@@ -364,7 +416,6 @@ class PolymarketBot:
         market = await loop.run_in_executor(None, get_market_info, window_ts)
         if market:
             self._market_cache[key] = market
-            # 清理旧窗口缓存
             old = str(window_ts - 600)
             for k in [k for k in self._market_cache if k < old]:
                 del self._market_cache[k]
@@ -399,23 +450,24 @@ async def _run(mode: str, capital: float):
 
 
 def main():
-    args = parse_args()
+    args    = parse_args()
     setup_logging(logging.DEBUG if args.debug else logging.INFO)
-
     mode    = args.mode
     capital = args.capital
 
     logger.info("=" * 60)
-    logger.info("  Polymarket BTC 末期套利 Bot")
+    logger.info("  Polymarket BTC 末期套利 Bot  v3")
     logger.info("  模式: %s  资金: $%.2f", mode.upper(), capital)
     logger.info("  价格源: Chainlink链上 > CryptoCompare > Binance")
     logger.info("  赔率源: CLOB 实时订单簿(每%ds) > Gamma 初始值(备用)",
                 cfg.poll_interval_secs)
     if _HAS_MC:
-        logger.info("  历史背景: MarketContext(90m K线趋势/波动率)")
-    logger.info("  策略: gap >= %.2f%%  边际 >= %.2f  入场 %ds~%ds",
-                cfg.min_gap_pct, cfg.entry_margin,
-                cfg.entry_window_start, cfg.entry_window_end)
+        logger.info("  历史背景: MarketContext（90m趋势/波动率，参与信号过滤）")
+    else:
+        logger.info("  历史背景: 未加载（MarketContext 不可用）")
+    logger.info("  信号路径: 路径1(跟赔率) | 路径2(赔率强信号) | 路径3(末期套利)")
+    logger.info("  入场窗口: %ds ~ %ds | 最小EV: %.2f",
+                cfg.entry_window_start, cfg.entry_window_end, cfg.min_ev_threshold)
     logger.info("=" * 60)
 
     if mode == "live":

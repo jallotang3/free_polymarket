@@ -38,9 +38,10 @@ class Config:
     # ── 策略参数 ──
     min_gap_pct: float    = field(default_factory=lambda: float(os.getenv("MIN_GAP_PCT", "0.10")))
     entry_margin: float   = field(default_factory=lambda: float(os.getenv("ENTRY_MARGIN", "0.03")))
-    min_ev_threshold: float = field(default_factory=lambda: float(os.getenv("MIN_EV_THRESHOLD", "0.02")))
-    # 入场窗口：仅在窗口第 N 秒 ~ M 秒之间允许下单（210s=3:30, 270s=4:30）
-    entry_window_start: int = 210   # 3 分 30 秒
+    min_ev_threshold: float = field(default_factory=lambda: float(os.getenv("MIN_EV_THRESHOLD", "0.05")))
+    # 入场窗口：下限 60s（分1）以允许路径2早期赔率信号；上限 270s（4:30）
+    # 策略内部对各路径有独立时机约束（路径2 minute>=1，路径1/3 minute>=3）
+    entry_window_start: int = 60    # 1 分钟
     entry_window_end: int   = 270   # 4 分 30 秒
 
     # ── 风险控制 ──
