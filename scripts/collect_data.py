@@ -210,7 +210,11 @@ def get_chainlink_onchain_price() -> tuple[float | None, int | None]:
     return None, None
 
 
-def get_polymarket_window(window_ts: int) -> dict | None:
+def get_polymarket_tokens(window_ts: int) -> dict | None:
+    """
+    从 Gamma API 获取窗口静态信息（token_id、condition_id 等）。
+    每个窗口只调用一次，不用于实时赔率（Gamma API 赔率更新滞后可达 0.30+）。
+    """
     slug = f"btc-updown-5m-{window_ts}"
     data = fetch_json(f"https://gamma-api.polymarket.com/events?slug={slug}")
     if not data:
@@ -218,20 +222,34 @@ def get_polymarket_window(window_ts: int) -> dict | None:
     try:
         ev = data[0]
         m = ev["markets"][0]
-        prices = json.loads(m["outcomePrices"])
         tokens = json.loads(m["clobTokenIds"])
+        prices = json.loads(m["outcomePrices"])
         return {
             "condition_id": m["conditionId"],
-            "up_token":  tokens[0],
-            "down_token": tokens[1],
-            "up_odds":   float(prices[0]),
-            "down_odds":  float(prices[1]),
-            "volume":    float(m.get("volume", 0)),
-            "active":    m.get("active", False),
-            "closed":    m.get("closed", False),
+            "up_token":    tokens[0],
+            "down_token":  tokens[1],
+            "volume":      float(m.get("volume", 0)),
+            "active":      m.get("active", False),
+            "closed":      m.get("closed", False),
+            # Gamma 初始赔率仅作备用（可能已滞后）
+            "gamma_up":    float(prices[0]),
+            "gamma_down":  float(prices[1]),
         }
     except (KeyError, IndexError, json.JSONDecodeError):
         return None
+
+
+def get_clob_midpoints(up_token: str, dn_token: str) -> tuple[float | None, float | None]:
+    """
+    从 CLOB 订单簿 API 获取 UP/DOWN token 的实时中间价。
+    实测更新延迟 < 1s，比 Gamma API outcomePrices 最高快 0.30+ 赔率单位。
+    返回 (up_mid, dn_mid)，失败返回 (None, None)。
+    """
+    r_up = fetch_json(f"https://clob.polymarket.com/midpoint?token_id={up_token}")
+    r_dn = fetch_json(f"https://clob.polymarket.com/midpoint?token_id={dn_token}")
+    up_mid = float(r_up["mid"]) if r_up and "mid" in r_up else None
+    dn_mid = float(r_dn["mid"]) if r_dn and "mid" in r_dn else None
+    return up_mid, dn_mid
 
 
 def get_current_window_ts() -> int:
@@ -401,28 +419,34 @@ def analyze_opportunity(
 
 async def main():
     print("=" * 65)
-    print("Polymarket BTC 5m 数据采集器 — 含 Chainlink 链上价格")
-    print("数据源: Chainlink链上(主) > CryptoCompare(次) > Binance(辅)")
+    print("Polymarket BTC 5m 数据采集器")
+    print("价格源: Chainlink链上(主) > CryptoCompare(次) > Binance(辅)")
+    print("赔率源: CLOB 实时订单簿(每5s) > Gamma API 初始值(仅备用)")
     print("按 Ctrl+C 停止")
     print("=" * 65)
 
     conn = init_db()
 
-    window_cache:    dict[int, dict]   = {}
+    token_cache:     dict[int, dict]   = {}   # Gamma API 静态 token 信息（每窗口一次）
     bn_ptb_cache:    dict[int, float]  = {}   # Binance 开盘价
-    cc_ptb_cache:    dict[int, float]  = {}   # CryptoCompare 开盘价（兼容旧逻辑）
+    cc_ptb_cache:    dict[int, float]  = {}   # CryptoCompare 开盘价
     cl_ptb_cache:    dict[int, float]  = {}   # Chainlink 链上开盘价（主用 PtB）
     ptb_delay_cache: dict[int, int]    = {}   # 开盘 PtB 记录时的延迟秒数
 
-    prev_up_odds:      float | None = None
-    prev_window_ts:    int | None   = None
-    prev_btc_price:    float | None = None
-    prev_bn_gap:       float | None = None
-    window_odds_jumped: bool        = False
+    # CLOB 实时赔率（每 poll 更新）
+    clob_odds_history: list[float]    = []   # 本窗口历史 up_odds，用于静止检测和跳变检测
+    last_clob_up:      float | None   = None
+    last_clob_dn:      float | None   = None
 
-    # Chainlink 链上价格缓存（避免每次 poll 都触发失败重试）
-    cl_last_price: float | None = None
-    cl_last_oracle_ts: int | None = None  # oracle 更新时间戳
+    prev_up_odds:       float | None = None
+    prev_window_ts:     int | None   = None
+    prev_btc_price:     float | None = None
+    prev_bn_gap:        float | None = None
+    window_odds_jumped: bool         = False
+
+    # Chainlink 链上价格缓存
+    cl_last_price:     float | None = None
+    cl_last_oracle_ts: int | None   = None
 
     try:
         while True:
@@ -462,6 +486,9 @@ async def main():
                 prev_bn_gap        = None
                 window_odds_jumped = False
                 prev_window_ts     = window_ts
+                clob_odds_history  = []
+                last_clob_up       = None
+                last_clob_dn       = None
 
             # ── 记录开盘 PtB（优先 Chainlink链上 > CC > Binance）──
             if window_ts not in bn_ptb_cache:
@@ -517,21 +544,34 @@ async def main():
             else:
                 primary_gap = bn_gap_pct
 
-            # ── 获取 Polymarket 赔率（每分钟缓存）──
-            cache_key = f"{window_ts}_{minute}"
-            if cache_key not in window_cache:
-                mkt = get_polymarket_window(window_ts)
-                if mkt:
-                    window_cache[cache_key] = mkt
+            # ── 获取 Gamma 静态信息（每窗口仅一次：token_id、condition_id）──
+            if window_ts not in token_cache:
+                tkn = get_polymarket_tokens(window_ts)
+                if tkn:
+                    token_cache[window_ts] = tkn
                 else:
-                    print(f"[{ts_str}] ⚠️  无法获取市场数据")
+                    print(f"[{ts_str}] ⚠️  无法获取市场 token 信息")
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-            mkt = window_cache.get(cache_key)
-            if not mkt:
+            tkn = token_cache.get(window_ts)
+            if not tkn:
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
+
+            # ── 获取 CLOB 实时赔率（每 poll 调用，比 Gamma 快 0.30+ 赔率单位）──
+            clob_up, clob_dn = get_clob_midpoints(tkn["up_token"], tkn["down_token"])
+            if clob_up is not None and clob_dn is not None:
+                last_clob_up, last_clob_dn = clob_up, clob_dn
+            else:
+                # CLOB 失败时沿用上一次有效值；首次失败则退回 Gamma 初始赔率
+                clob_up = last_clob_up if last_clob_up is not None else tkn["gamma_up"]
+                clob_dn = last_clob_dn if last_clob_dn is not None else tkn["gamma_down"]
+                if last_clob_up is None:
+                    print(f"[{ts_str}] ⚠️  CLOB 赔率获取失败，使用 Gamma 初始值")
+
+            # 记录本窗口历史（用于静止检测）
+            clob_odds_history.append(clob_up)
 
             obs = {
                 "ts":                now,
@@ -545,10 +585,10 @@ async def main():
                 "gap_pct":           primary_gap,
                 "bn_gap_pct":        bn_gap_pct,
                 "cl_onchain_gap_pct": cl_onchain_gap_pct,
-                "up_odds":           mkt["up_odds"],
-                "down_odds":         mkt["down_odds"],
-                "volume":            mkt["volume"],
-                "condition_id":      mkt["condition_id"],
+                "up_odds":           clob_up,
+                "down_odds":         clob_dn,
+                "volume":            tkn["volume"],
+                "condition_id":      tkn["condition_id"],
             }
 
             log_observation(conn, obs)
@@ -563,28 +603,24 @@ async def main():
             prev_btc_price = btc_price
             prev_bn_gap    = bn_gap_pct
 
-            # ── 赔率跳变检测（最可靠信号，不依赖 PtB 估算）──
+            # ── 赔率跳变检测（CLOB 实时，比 Gamma 更早捕捉）──
             odds_jump_signal = ""
             if prev_up_odds is not None:
-                delta = mkt["up_odds"] - prev_up_odds
+                delta = clob_up - prev_up_odds
                 if abs(delta) >= 0.10:
                     jump_dir = "UP" if delta > 0 else "DOWN"
-                    dominant = mkt["up_odds"] if delta > 0 else mkt["down_odds"]
+                    dominant = clob_up if delta > 0 else clob_dn
                     odds_jump_signal = (
                         f" 🔔 赔率跳变{delta:+.2f}→{jump_dir}={dominant:.2f}"
-                        f"(Chainlink已确认)"
+                        f"(CLOB实时)"
                     )
                     window_odds_jumped = True
-            prev_up_odds = mkt["up_odds"]
+            prev_up_odds = clob_up
 
-            # ── 赔率静止警告 ──
-            window_odds_list = [
-                v["up_odds"] for k, v in window_cache.items()
-                if k.startswith(str(window_ts))
-            ]
+            # ── 赔率静止警告（基于 CLOB 实时历史，比 Gamma 更敏感）──
             odds_static_warn = ""
-            if len(window_odds_list) >= 4:
-                spread = max(window_odds_list) - min(window_odds_list)
+            if len(clob_odds_history) >= 4:
+                spread = max(clob_odds_history) - min(clob_odds_history)
                 if spread < 0.02:
                     odds_static_warn = " 📊[赔率静止，流动性极低]"
 
