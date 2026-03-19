@@ -31,6 +31,10 @@ class Config:
     # ── Telegram ──
     telegram_token: str   = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
+    # 机器别名：多机部署时用于区分消息来源，显示在每条 Telegram 通知顶部
+    # 建议设置为易识别的名称，如 "Mac-主力" / "云服务器-备用" / "VPS-A"
+    # 留空则自动使用钱包地址后6位
+    bot_alias: str        = field(default_factory=lambda: os.getenv("BOT_ALIAS", ""))
 
     # ── 运行模式 ──
     mode: str             = field(default_factory=lambda: os.getenv("MODE", "paper"))

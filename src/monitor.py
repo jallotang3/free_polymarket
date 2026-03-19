@@ -107,6 +107,19 @@ class TelegramNotifier:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._logger = logging.getLogger("telegram")
 
+        # 机器标识：用于多机部署时区分消息来源
+        # 优先使用 BOT_ALIAS，否则自动用钱包地址后6位
+        if cfg.bot_alias:
+            self._alias = cfg.bot_alias
+        elif cfg.wallet_address:
+            self._alias = f"钱包…{cfg.wallet_address[-6:]}"
+        else:
+            self._alias = "Bot"
+
+    def _header(self) -> str:
+        """生成统一的机器标识头部，附加在每条消息最前面。"""
+        return f"🖥 <code>{self._alias}</code>\n"
+
     async def run(self):
         """后台消费消息队列"""
         if not self._enabled:
@@ -159,6 +172,7 @@ class TelegramNotifier:
         elif capital > 0:
             bal_line = f"\n💰 账户资金: <b>${capital:.2f}</b>"
         return (
+            f"{self._header()}"
             f"{emoji} <b>{mode_str}下单</b>\n"
             f"方向: <b>{direction}</b>  金额: <b>${amount:.2f}</b>\n"
             f"入场价: {entry_price:.3f}  EV: {ev:+.4f}  gap: {gap:+.3f}%"
@@ -177,6 +191,7 @@ class TelegramNotifier:
         elif capital > 0:
             bal_line = f"\n💰 账户资金: <b>${capital:.2f}</b>"
         return (
+            f"{self._header()}"
             f"{emoji} <b>{mode_str}结算</b>\n"
             f"方向: {direction}  结果: <b>{result}</b>  PnL: <b>{pnl:+.2f} USDC</b>\n"
             f"累计 PnL: {total_pnl:+.2f}  历史胜率: {win_rate:.1%}"
@@ -187,16 +202,21 @@ class TelegramNotifier:
         wr = wins / trades if trades else 0
         emoji = "📈" if pnl > 0 else "📉"
         return (
+            f"{self._header()}"
             f"{emoji} <b>日报 {date}</b>\n"
             f"交易: {trades}  胜: {wins}  胜率: {wr:.1%}\n"
             f"日收益: <b>{pnl:+.2f} USDC</b>"
         )
 
     def risk_alert(self, reason: str):
-        return f"⚠️ <b>风控告警</b>\n{reason}"
+        return (
+            f"{self._header()}"
+            f"⚠️ <b>风控告警</b>\n{reason}"
+        )
 
     def system_start(self, mode: str, capital: float):
         return (
+            f"{self._header()}"
             f"🚀 <b>Bot 启动</b>\n"
             f"模式: {'实盘 🔴' if mode=='live' else '纸面 🟡'}\n"
             f"初始资金: ${capital:.2f}"
@@ -204,6 +224,7 @@ class TelegramNotifier:
 
     def system_stop(self, reason: str, final_pnl: float):
         return (
+            f"{self._header()}"
             f"🛑 <b>Bot 停止</b>\n"
             f"原因: {reason}\n"
             f"最终 PnL: {final_pnl:+.2f} USDC"

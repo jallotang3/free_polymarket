@@ -192,9 +192,12 @@ class AutoRedeemer:
                 # 兑换成功后发 Telegram 通知（含钱包余额）
                 if self._notify:
                     try:
+                        from .config import cfg
+                        alias = cfg.bot_alias or (f"钱包…{self._wallet[-6:]}" if self._wallet else "Bot")
                         bal = self._get_bal() if self._get_bal else 0.0
                         bal_line = f"\n💰 钱包余额: <b>${bal:.2f} USDC.e</b>" if bal > 0 else ""
                         msg = (
+                            f"🖥 <code>{alias}</code>\n"
                             f"💵 <b>自动兑换成功</b>\n"
                             f"市场: {title[:40]}\n"
                             f"数量: <b>{pos.size:.4f}</b> shares\n"
