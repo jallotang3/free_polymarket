@@ -284,6 +284,78 @@ def get_current_window_ts() -> int:
     return now - (now % 300)
 
 
+def fetch_window_result(window_ts: int) -> dict | None:
+    """
+    从 Gamma API 查询已结算窗口的 UP/DOWN 结果。
+    结算后 outcomePrices 会变为 [1.0, 0.0]（UP赢）或 [0.0, 1.0]（DOWN赢）。
+    窗口结束 10s 后才查询（避免结算延迟）。
+    返回 {"result": "Up"/"Down", "final_btc": 价格} 或 None。
+    """
+    slug = f"btc-updown-5m-{window_ts}"
+    data = fetch_json(f"https://gamma-api.polymarket.com/events?slug={slug}")
+    if not data:
+        return None
+    try:
+        m      = data[0]["markets"][0]
+        closed = m.get("closed", False)
+        if not closed:
+            return None  # 窗口尚未结算
+        prices = json.loads(m["outcomePrices"])
+        up_p   = float(prices[0])
+        dn_p   = float(prices[1])
+        # 结算结果：哪方赔率趋近 1.0 即为胜出
+        if up_p >= 0.99:
+            result = "Up"
+        elif dn_p >= 0.99:
+            result = "Down"
+        else:
+            return None  # 还未最终结算
+        return {"result": result}
+    except (KeyError, IndexError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def record_window_result(conn: sqlite3.Connection, window_ts: int, result: str):
+    """将窗口结算结果写入 window_results 表。"""
+    conn.execute("""
+        INSERT OR REPLACE INTO window_results (window_ts, result, recorded_at)
+        VALUES (?, ?, ?)
+    """, (window_ts, result, int(time.time())))
+    conn.commit()
+
+
+def check_and_record_results(conn: sqlite3.Connection, active_windows: set[int]):
+    """
+    检查所有「已结束但未记录结算结果」的窗口，查询并写入结果。
+    每次 poll 调用，轻量级：先本地过滤，再按需查 Gamma API。
+    """
+    now = int(time.time())
+    # 只检查 10s 前已结束的窗口（给 Gamma API 结算时间）
+    settled_before = now - 310
+
+    # 本地已记录的窗口
+    recorded = {r[0] for r in conn.execute("SELECT window_ts FROM window_results").fetchall()}
+
+    # 从 observations 里找有数据但还没记录结果的历史窗口（最多检查最近50个）
+    candidates = conn.execute("""
+        SELECT DISTINCT window_ts FROM observations
+        WHERE window_ts < ? AND window_ts NOT IN (
+            SELECT window_ts FROM window_results
+        )
+        ORDER BY window_ts DESC
+        LIMIT 50
+    """, (settled_before,)).fetchall()
+
+    newly_recorded = []
+    for (wts,) in candidates:
+        res = fetch_window_result(wts)
+        if res:
+            record_window_result(conn, wts, res["result"])
+            newly_recorded.append((wts, res["result"]))
+
+    return newly_recorded
+
+
 def log_observation(conn: sqlite3.Connection, obs: dict):
     conn.execute("""
         INSERT INTO observations
@@ -554,6 +626,9 @@ async def main():
     cl_last_price:     float | None = None
     cl_last_oracle_ts: int | None   = None
 
+    # 结算结果检查：每30s执行一次（避免频繁调 Gamma API）
+    last_result_check_ts: int = 0
+
     try:
         while True:
             now        = int(time.time())
@@ -713,6 +788,15 @@ async def main():
             }
 
             log_observation(conn, obs)
+
+            # ── 周期性检查并记录已结算窗口（每30s，不阻塞主循环）──
+            if now - last_result_check_ts >= 30:
+                last_result_check_ts = now
+                newly = check_and_record_results(conn, set(token_cache.keys()))
+                for wts, result in newly:
+                    import datetime as _dt
+                    wt_str = _dt.datetime.fromtimestamp(wts).strftime('%H:%M')
+                    print(f"[{ts_str}] 📊 结算记录: {wt_str} 窗口 → {result}")
 
             # ── 价格趋势计算 ──
             btc_trend_pct: float | None = None

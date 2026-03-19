@@ -145,6 +145,10 @@ class PaperExecutor:
     def __init__(self, db: TradeDB):
         self.db = db
 
+    def get_wallet_usdc_balance(self) -> float:
+        """Paper 模式无链上余额，返回 0"""
+        return 0.0
+
     async def place(self, signal: Signal, window_ts: int) -> Optional[TradeRecord]:
         size = signal.bet_amount / signal.market_price
         rec = TradeRecord(
@@ -193,6 +197,34 @@ class LiveExecutor:
     def __init__(self, db: TradeDB):
         self.db = db
         self._client = None
+        self._w3 = None  # web3 实例（懒加载，用于查链上余额）
+
+    def get_wallet_usdc_balance(self) -> float:
+        """
+        查询钱包链上 USDC.e 余额（实时）。
+        失败时返回 0.0，不影响主流程。
+        """
+        try:
+            from web3 import Web3
+            if self._w3 is None or not self._w3.is_connected():
+                self._w3 = Web3(Web3.HTTPProvider(
+                    'https://polygon-bor.publicnode.com',
+                    request_kwargs={'timeout': 5},
+                ))
+            USDC_E = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'
+            ERC20_ABI = [{"name": "balanceOf", "type": "function", "stateMutability": "view",
+                          "inputs": [{"name": "account", "type": "address"}],
+                          "outputs": [{"name": "", "type": "uint256"}]}]
+            usdc = self._w3.eth.contract(
+                address=Web3.to_checksum_address(USDC_E), abi=ERC20_ABI
+            )
+            bal = usdc.functions.balanceOf(
+                Web3.to_checksum_address(cfg.wallet_address)
+            ).call()
+            return bal / 1e6  # USDC.e 6位小数
+        except Exception as e:
+            logger.debug("查询链上余额失败: %s", e)
+            return 0.0
 
     def _get_client(self):
         if self._client:
@@ -218,7 +250,90 @@ class LiveExecutor:
             funder=cfg.wallet_address,
         )
         logger.info("Polymarket CLOB 客户端已初始化 (wallet=%s...)", cfg.wallet_address[:8])
+
+        # 自动检查并补全 USDC.e approve（仅首次初始化时执行）
+        self._ensure_usdc_allowance()
         return self._client
+
+    def _ensure_usdc_allowance(self):
+        """
+        检查钱包对 Polymarket 三个合约的 USDC.e allowance。
+        若 allowance 不足，自动发送链上 approve 交易（无限额度）。
+        Polymarket 合约地址（Polygon）：
+          CTF Exchange:      0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
+          Neg Risk Exchange: 0xC5d563A36AE78145C45a50134d48A1215220f80a
+          Neg Risk Adapter:  0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296
+        """
+        try:
+            from web3 import Web3
+        except ImportError:
+            logger.warning("web3 未安装，跳过 allowance 检查。如遇 'not enough allowance' 错误，请运行: pip install web3")
+            return
+
+        USDC_E = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'
+        SPENDERS = [
+            ('CTF Exchange',      '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E'),
+            ('Neg Risk Exchange', '0xC5d563A36AE78145C45a50134d48A1215220f80a'),
+            ('Neg Risk Adapter',  '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296'),
+        ]
+        POLYGON_RPC = 'https://polygon-bor.publicnode.com'
+        MIN_ALLOWANCE = 10 * 10**6  # 低于 10 USDC.e 视为需补充授权
+
+        ERC20_ABI = [
+            {"name": "allowance", "type": "function", "stateMutability": "view",
+             "inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
+             "outputs": [{"name": "", "type": "uint256"}]},
+            {"name": "approve", "type": "function", "stateMutability": "nonpayable",
+             "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
+             "outputs": [{"name": "", "type": "bool"}]},
+        ]
+
+        try:
+            proxy = os.environ.get("PROXY_URL", "").strip()
+            rpc_kwargs = {'timeout': 10}
+            if proxy:
+                rpc_kwargs['proxies'] = {'http': proxy, 'https': proxy}
+            w3 = Web3(Web3.HTTPProvider(POLYGON_RPC, request_kwargs=rpc_kwargs))
+            if not w3.is_connected():
+                logger.warning("Polygon RPC 连接失败，跳过 allowance 检查")
+                return
+
+            wallet = Web3.to_checksum_address(cfg.wallet_address)
+            usdc   = w3.eth.contract(address=Web3.to_checksum_address(USDC_E), abi=ERC20_ABI)
+            MAX_UINT = 2**256 - 1
+
+            needs_approve = []
+            for name, spender in SPENDERS:
+                al = usdc.functions.allowance(wallet, Web3.to_checksum_address(spender)).call()
+                if al < MIN_ALLOWANCE:
+                    needs_approve.append((name, spender))
+                    logger.info("USDC.e allowance 不足 [%s]: %d，需要 approve", name, al)
+
+            if not needs_approve:
+                logger.info("✅ USDC.e allowance 检查通过，所有合约已授权")
+                return
+
+            # 发送 approve 交易
+            for name, spender in needs_approve:
+                nonce    = w3.eth.get_transaction_count(wallet)
+                gas_px   = w3.eth.gas_price
+                tx = usdc.functions.approve(
+                    Web3.to_checksum_address(spender), MAX_UINT
+                ).build_transaction({
+                    'from': wallet, 'nonce': nonce,
+                    'gas': 100_000, 'gasPrice': gas_px, 'chainId': 137,
+                })
+                signed   = w3.eth.account.sign_transaction(tx, cfg.private_key)
+                tx_hash  = w3.eth.send_raw_transaction(signed.raw_transaction)
+                logger.info("USDC.e approve [%s] tx: %s", name, tx_hash.hex())
+                receipt  = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                if receipt.status == 1:
+                    logger.info("✅ approve [%s] 上链成功 (区块 %d)", name, receipt.blockNumber)
+                else:
+                    logger.error("❌ approve [%s] 上链失败", name)
+
+        except Exception as e:
+            logger.warning("allowance 检查/授权异常（不影响下单，若持续报错请手动 approve）: %s", e)
 
     async def place(self, signal: Signal, window_ts: int) -> Optional[TradeRecord]:
         loop = asyncio.get_event_loop()
@@ -230,25 +345,29 @@ class LiveExecutor:
             return None
 
     def _do_place(self, signal: Signal, window_ts: int) -> Optional[TradeRecord]:
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
         from py_clob_client.order_builder.constants import BUY
 
         client = self._get_client()
 
-        # 获取 tick size
+        # 获取 tick size（通过 condition_id 查询）
+        tick_size = "0.01"
+        neg_risk  = False
         try:
-            mkt_detail = client.get_market(
-                # condition_id 需要从 market info 中传入
-                # 这里用 token_id 所在市场查询
-                signal.token_id[:10] + "..."
-            )
-            tick_size = str(mkt_detail.get("minimum_tick_size", "0.01"))
-            neg_risk = mkt_detail.get("neg_risk", False)
-        except Exception:
-            tick_size = "0.01"
-            neg_risk = False
+            mkt_detail = client.get_market(signal.condition_id)
+            tick_size  = str(mkt_detail.get("minimum_tick_size", "0.01"))
+            neg_risk   = bool(mkt_detail.get("neg_risk", False))
+        except Exception as e:
+            logger.debug("get_market 失败，使用默认 tick_size=0.01: %s", e)
 
+        MIN_SIZE = 5.0  # Polymarket 最小订单 size（token 数量）
         size = round(signal.bet_amount / signal.market_price, 2)
+        if size < MIN_SIZE:
+            # 补足到最小 size，同时重新计算实际 USDC 花费
+            size = MIN_SIZE
+            logger.info("订单 size %.2f 低于最小值 %g，调整到 %g token（实际花费 $%.2f）",
+                        signal.bet_amount / signal.market_price, MIN_SIZE, size,
+                        size * signal.market_price)
         price = round(signal.market_price, 4)
 
         resp = client.create_and_post_order(
@@ -257,9 +376,11 @@ class LiveExecutor:
                 price=price,
                 size=size,
                 side=BUY,
-                order_type=OrderType.GTC,
             ),
-            options={"tick_size": tick_size, "neg_risk": neg_risk},
+            options=PartialCreateOrderOptions(
+                tick_size=tick_size,
+                neg_risk=neg_risk,
+            ),
         )
 
         order_id = resp.get("orderID") or resp.get("id", "unknown")
@@ -275,7 +396,7 @@ class LiveExecutor:
             token_id=signal.token_id,
             entry_price=price,
             size=size,
-            amount_usdc=signal.bet_amount,
+            amount_usdc=round(size * price, 4),  # 实际花费（已修正 min size 后）
             order_id=order_id,
             mode="live",
             status="open",

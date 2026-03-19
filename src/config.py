@@ -38,7 +38,7 @@ class Config:
     # ── 策略参数 ──
     min_gap_pct: float    = field(default_factory=lambda: float(os.getenv("MIN_GAP_PCT", "0.10")))
     entry_margin: float   = field(default_factory=lambda: float(os.getenv("ENTRY_MARGIN", "0.03")))
-    min_ev_threshold: float = field(default_factory=lambda: float(os.getenv("MIN_EV_THRESHOLD", "0.05")))
+    min_ev_threshold: float = field(default_factory=lambda: float(os.getenv("MIN_EV_THRESHOLD", "0.08")))
     # 入场窗口：下限 60s（分1）以允许路径2早期赔率信号；上限 270s（4:30）
     # 策略内部对各路径有独立时机约束（路径2 minute>=1，路径1/3 minute>=3）
     entry_window_start: int = 60    # 1 分钟
@@ -46,6 +46,15 @@ class Config:
 
     # ── 风险控制 ──
     max_bet_fraction: float       = field(default_factory=lambda: float(os.getenv("MAX_BET_FRACTION", "0.05")))
+    # 实盘单笔最大注额（USDC 硬上限，0=不限）
+    # 实盘分析：Kelly 复利会让内存资金虚涨，导致单笔注额远超实际钱包余额，设置硬上限防止失控
+    max_bet_usdc: float           = field(default_factory=lambda: float(os.getenv("MAX_BET_USDC", "0")))
+    # 低赔率机会（market_price < LOW_ODDS_THRESH）允许更高的 Kelly 上限
+    # 数据验证：entry_price < 0.55 时实际胜率 96.4%，可适当提高仓位
+    low_odds_thresh: float        = 0.55
+    high_conf_bet_fraction: float = field(default_factory=lambda: float(os.getenv("HIGH_CONF_BET_FRACTION", "0.25")))
+    # Paper 模式资金上限 = 初始资金 × paper_capital_multiplier，避免复利失控导致数据失真
+    paper_capital_multiplier: float = 3.0
     max_daily_loss_fraction: float = field(default_factory=lambda: float(os.getenv("MAX_DAILY_LOSS_FRACTION", "0.15")))
     max_consecutive_losses: int   = 5
     pause_after_loss_minutes: int = 60

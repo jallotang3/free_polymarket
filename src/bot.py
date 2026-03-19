@@ -78,11 +78,14 @@ class PolymarketBot:
         # 历史背景模块（Phase 2）
         self.mc: Optional[MarketContext] = MarketContext() if _HAS_MC else None
 
-        # 自动兑换模块
+        # 自动兑换模块（注入 Telegram 通知和余额查询回调）
         self.redeemer = AutoRedeemer(
-            private_key    = cfg.private_key,
-            wallet_address = cfg.wallet_address,
-            signature_type = 0,   # EOA
+            private_key          = cfg.private_key,
+            wallet_address       = cfg.wallet_address,
+            signature_type       = 0,   # EOA
+            notify_callback      = notifier.notify if cfg.has_telegram else None,
+            get_balance_callback = (self.executor.get_wallet_usdc_balance
+                                    if mode == "live" else None),
         )
 
         # 状态
@@ -223,7 +226,14 @@ class PolymarketBot:
         self.strategy.update_odds_history(window_ts, clob_up)
 
         # ── 6. 同步资金 ──
-        self.strategy.update_capital(self.risk.current_capital)
+        # Paper 模式：资金上限 = 初始资金 × paper_capital_multiplier
+        # 避免 Kelly 复利无限膨胀导致注额失真，影响策略分析的参考价值
+        if self.mode == "paper":
+            paper_cap = self.initial_capital * cfg.paper_capital_multiplier
+            capped_capital = min(self.risk.current_capital, paper_cap)
+            self.strategy.update_capital(capped_capital)
+        else:
+            self.strategy.update_capital(self.risk.current_capital)
 
         # ── 7. 预计算历史背景置信度（供路径2早期拦截使用）──
         mc_conf_up  = 1.0
@@ -311,7 +321,31 @@ class PolymarketBot:
             except Exception:
                 pass
 
-        # ── 13. 执行下单 ──
+        # ── 13. 实盘注额修正：以链上余额为准，并应用 MAX_BET_USDC 硬上限 ──
+        # 原因：Kelly 复利会让内存资金虚涨，导致注额远超实际钱包余额（详见实盘分析报告）
+        if self.mode == "live":
+            try:
+                chain_bal = self.executor.get_wallet_usdc_balance()
+                if chain_bal > 0:
+                    # 可用资金 = min(内存资金, 链上余额) × max_bet_fraction
+                    effective_capital = min(self.risk.current_capital, chain_bal)
+                    kelly_bet = effective_capital * signal.kelly_fraction
+                    # MAX_BET_USDC 硬上限
+                    if cfg.max_bet_usdc > 0:
+                        kelly_bet = min(kelly_bet, cfg.max_bet_usdc)
+                    if kelly_bet < signal.bet_amount * 0.5:
+                        logger.warning(
+                            "注额修正: $%.2f → $%.2f (链上余额=%.2f USDC.e, 内存资金=%.2f)",
+                            signal.bet_amount, kelly_bet, chain_bal, self.risk.current_capital,
+                        )
+                    signal.bet_amount = max(kelly_bet, 1.0)
+            except Exception as e:
+                logger.debug("链上余额查询失败，使用内存资金: %s", e)
+                # 兜底：仅应用 MAX_BET_USDC 硬上限
+                if cfg.max_bet_usdc > 0:
+                    signal.bet_amount = min(signal.bet_amount, cfg.max_bet_usdc)
+
+        # ── 14. 执行下单 ──
         trade = await self.executor.place(signal, window_ts)
         if trade is None:
             logger.error("下单失败")
@@ -325,9 +359,17 @@ class PolymarketBot:
             signal.market_price, signal.ev_per_unit,
             signal.gap_pct, signal.gap_src, signal.note,
         )
+        # 查链上余额（实盘才查，避免不必要的网络请求）
+        wallet_usdc = 0.0
+        if self.mode == "live":
+            try:
+                wallet_usdc = self.executor.get_wallet_usdc_balance()
+            except Exception:
+                pass
         notifier.notify(notifier.trade_opened(
-            self.mode, signal.direction.value, signal.bet_amount,
+            self.mode, signal.direction.value, trade.amount_usdc,
             signal.market_price, signal.ev_per_unit, signal.gap_pct,
+            capital=self.risk.current_capital, wallet_usdc=wallet_usdc,
         ))
 
     # ── 结算循环 ──────────────────────────────────────
@@ -376,9 +418,17 @@ class PolymarketBot:
                 trade.direction, result, pnl,
                 self.risk.win_rate * 100, self.risk.stats["pnl"],
             )
+            # 查链上余额（实盘才查）
+            wallet_usdc_settle = 0.0
+            if self.mode == "live":
+                try:
+                    wallet_usdc_settle = self.executor.get_wallet_usdc_balance()
+                except Exception:
+                    pass
             notifier.notify(notifier.trade_settled(
                 self.mode, trade.direction, result,
                 pnl, self.risk.win_rate, self.risk.stats["pnl"],
+                capital=self.risk.current_capital, wallet_usdc=wallet_usdc_settle,
             ))
 
             # ── 自动兑换（实盘模式 + 赢单 + redeemer 可用）──
@@ -504,17 +554,15 @@ def main():
     logger.info("=" * 60)
 
     if mode == "live":
-        # 预检：实盘依赖
-        try:
-            import py_clob_client  # noqa: F401
-        except ImportError:
+        # 预检：实盘依赖（用 find_spec 只检查包是否存在，避免 import 执行时的副作用）
+        import importlib.util as _ilu
+        if _ilu.find_spec("py_clob_client") is None:
             logger.error(
                 "实盘模式需要 py-clob-client，当前 Python 未安装。\n"
-                "  请使用项目虚拟环境运行：\n"
-                "    ./run_bot.sh --mode live\n"
-                "  或手动激活后运行：\n"
-                "    source .venv/bin/activate\n"
-                "    python -m src.bot --mode live"
+                "  安装命令：\n"
+                "    pip3 install --break-system-packages py-clob-client\n"
+                "  或在虚拟环境中：\n"
+                "    .venv/bin/pip install py-clob-client"
             )
             sys.exit(1)
 

@@ -32,6 +32,7 @@ class Direction(str, Enum):
 class Signal:
     direction: Direction
     token_id:  str
+    condition_id: str
     theoretical_win_rate: float
     market_price: float
     ev_per_unit: float
@@ -71,6 +72,9 @@ class WindowState:
     trade_direction: Optional[Direction] = None
     odds_jumped:     bool = False
     prev_up_odds:    Optional[float] = None
+    jump_ts:         float = 0.0    # 最近一次跳变的时间戳（unix）
+    jump_dir_up:     Optional[bool] = None  # 跳变方向（True=UP跳, False=DOWN跳）
+    jump_count:      int   = 0      # 同向连续跳变次数（用于延长冷却期）
 
 
 class LateStageArbitrageStrategy:
@@ -98,10 +102,20 @@ class LateStageArbitrageStrategy:
         if state.prev_up_odds is not None:
             delta = up_odds - state.prev_up_odds
             if abs(delta) >= 0.10:
-                state.odds_jumped = True
+                new_dir_up = delta > 0
+                # 同向连续跳变计数（用于延长冷却）
+                if state.jump_dir_up is not None and state.jump_dir_up == new_dir_up:
+                    state.jump_count += 1
+                else:
+                    state.jump_count = 1
+                state.odds_jumped  = True
+                state.jump_ts      = time.time()
+                state.jump_dir_up  = new_dir_up
                 jump_dir = "UP" if delta > 0 else "DOWN"
-                logger.info("🔔 赔率跳变 %+.2f → %s=%.2f (CLOB实时)",
-                            delta, jump_dir, up_odds if delta > 0 else (1 - up_odds))
+                logger.info("🔔 赔率跳变 %+.2f → %s=%.2f (连续%d次)",
+                            delta, jump_dir,
+                            up_odds if delta > 0 else (1 - up_odds),
+                            state.jump_count)
         state.prev_up_odds = up_odds
 
     def evaluate(
@@ -183,9 +197,10 @@ class LateStageArbitrageStrategy:
                 if ev > cfg.min_ev_threshold:
                     direction = Direction.UP if mkt_up_dom else Direction.DOWN
                     token_id  = market.up_token if mkt_up_dom else market.down_token
-                    kelly     = self._kelly(theo_wr, mkt_price)
+                    kelly     = self._kelly_with_low_odds(theo_wr, mkt_price)
                     return Signal(
                         direction=direction, token_id=token_id,
+                        condition_id=market.condition_id,
                         theoretical_win_rate=theo_wr, market_price=mkt_price,
                         ev_per_unit=ev, ev_after_fee=ev_fee, gap_pct=gap, gap_src=gap_src,
                         seconds_remaining=secs_remaining, kelly_fraction=kelly,
@@ -201,15 +216,35 @@ class LateStageArbitrageStrategy:
         if sig is not None:
             return sig
 
-        # ── 路径 3（末期套利）：gap >= 0.05% ──
+        # ── 路径 3（末期套利）：gap >= 0.10% + minute >= 3 ──
         gap_abs = abs(gap)
+        if gap_abs < 0.10:
+            logger.debug("gap 不足 0.10%%（%.3f%%），弱套利不下单", gap_abs)
+            return None
+
         theo_wr = self._theo_win_rate(gap_abs, minute)
         if theo_wr < 0.85:
+            return None
+
+        # TWR=0.968（gap 0.10~0.15%）实际胜率 84%，比理论值低 12.8%，仅允许分3/分4
+        # 数据：分1/2 的 TWR=0.968 贡献了多笔亏损，限制早期入场
+        if theo_wr == 0.968 and minute < 3:
+            logger.debug("末期套利 TWR=0.968 早期拦截: minute=%d (需≥3)", minute)
             return None
 
         direction    = Direction.UP if gap > 0 else Direction.DOWN
         market_price = up_odds if gap > 0 else down_odds
         token_id     = market.up_token if gap > 0 else market.down_token
+
+        # 末期套利：高赔率（>0.85）需要更高置信度
+        # 实盘案例（05:43 Up@0.885 conf=0.52 震荡 -$5.00）：
+        #   conf=0.52 震荡市下的高赔率信号在分3也不可靠，门槛提至0.60
+        if market_price > 0.85 and signal_confidence < 0.60:
+            logger.debug(
+                "末期套利高赔率置信度拦截: price=%.3f conf=%.2f < 0.60",
+                market_price, signal_confidence,
+            )
+            return None
 
         edge = theo_wr - market_price
         if edge < cfg.entry_margin:
@@ -225,20 +260,18 @@ class LateStageArbitrageStrategy:
         if orderbook is not None:
             theo_wr = self._adjust_for_orderbook(theo_wr, direction, market_price, orderbook)
 
-        if gap_abs < 0.10:
-            logger.debug("gap 不足 0.10%%（%.3f%%），弱套利不下单", gap_abs)
-            return None
-
-        kelly    = self._kelly(theo_wr, market_price)
-        signal   = Signal(
+        # 低赔率机会允许更高 Kelly 上限
+        kelly  = self._kelly_with_low_odds(theo_wr, market_price)
+        signal = Signal(
             direction=direction, token_id=token_id,
+            condition_id=market.condition_id,
             theoretical_win_rate=theo_wr, market_price=market_price,
             ev_per_unit=ev, ev_after_fee=ev_fee, gap_pct=gap, gap_src=gap_src,
             seconds_remaining=secs_remaining, kelly_fraction=kelly,
             bet_amount=self.total_capital * kelly, signal_type="末期套利",
         )
         if signal.is_valid:
-            logger.info("🟢 %s 信号: %s", sig_type, signal.summary())
+            logger.info("🟢 末期套利信号: %s", signal.summary())
         return signal if signal.is_valid else None
 
     # ── 辅助方法 ──────────────────────────────────────────────
@@ -251,9 +284,13 @@ class LateStageArbitrageStrategy:
         """
         路径2：gap 不足（< 0.05%）但 CLOB 赔率极强时的独立信号。
         分层触发：
-          minute=1: 已跳变 + (gap同向≥0.02% 或 赔率≥0.85) + 历史可信度≥0.40
-          minute=2: 已跳变 + (gap同向≥0.01% 或 赔率≥0.75) + 历史可信度≥0.35
+          minute=1: 禁止 TWR=0.860（赔率0.72~0.85）信号，需赔率≥0.85 + 已跳变 + 高可信度
+          minute=2: UP 方向额外要求 price<0.80 且 gap同向≥0.15%；DOWN 维持原门槛
           minute≥3: 赔率≥0.72（无需跳变/gap/context）
+        数据依据（2026-03-18~19 186笔 paper 交易）：
+          - 分1 TWR=0.860 整体胜率仅 73.1%，是主要亏损来源，禁止入场
+          - 分2 UP 胜率 65%，需更严格的 gap+赔率 双重确认
+          - TWR=0.968（赔率≥0.85）分3/分4 胜率 84~100%，分1/2 建议高置信度才允许
         """
         odds_dominant = max(market.up_odds, market.down_odds)
         if odds_dominant < STRONG_ODDS_THRESH:
@@ -272,49 +309,112 @@ class LateStageArbitrageStrategy:
         if not timing_ok or gap_conflicts:
             return None
 
-        # 早期分钟额外验证：防止"假跳变"（近零gap + 历史无支撑）
-        if state.odds_jumped and minute <= 2:
-            gap_same_dir = (
-                (odds_dir == Direction.DOWN and gap < 0) or
-                (odds_dir == Direction.UP   and gap > 0)
-            )
-            if minute == 1:
-                # 低可信度（逆势）时不论方向均收紧门槛，避免假跳变
-                # paper 交易分1亏损根本原因是低 confidence + 小 gap，与方向无关
-                if signal_confidence < 0.50:
-                    min_gap, min_odds_solo, min_conf = 0.03, 0.85, 0.50
-                else:
-                    min_gap, min_odds_solo, min_conf = 0.02, 0.85, 0.40
-            else:
-                min_gap, min_odds_solo, min_conf = 0.01, 0.75, 0.35
-
-            gap_confirmed = gap_same_dir and abs(gap) >= min_gap
-            odds_solo_ok  = odds_px >= min_odds_solo
-            conf_ok       = signal_confidence >= min_conf
-
-            if not ((gap_confirmed or odds_solo_ok) and conf_ok):
+        # ── P1：跳变冷却期 ──────────────────────────────────────────
+        # 基础冷却 15s：防止假跳变（实盘04:38案例：+0.25后10s内连续反向跳变）
+        # 连续跳变延长：若同向跳变次数≥2，冷却延长至20s（实盘05:47案例：
+        #   -0.16 → -0.17 两次同向跳变后26s下单，下单后8s出现+0.26反向跳变）
+        # 注意：30s太长会错过整个分3信号窗口（5分钟市场时间宝贵），折衷为20s
+        BASE_COOLDOWN  = 15
+        MULTI_COOLDOWN = 20
+        if state.odds_jumped and state.jump_ts > 0:
+            secs_since_jump = time.time() - state.jump_ts
+            jump_count = getattr(state, 'jump_count', 1)
+            cooldown = MULTI_COOLDOWN if jump_count >= 2 else BASE_COOLDOWN
+            if secs_since_jump < cooldown:
                 logger.debug(
-                    "赔率强信号早期拦截: min=%d dir=%s gap=%.3f%% odds=%.2f conf=%.2f",
-                    minute, odds_dir.value, gap, odds_px, signal_confidence,
+                    "跳变冷却拦截: 跳变%d次 距上次%.0fs < %ds",
+                    jump_count, secs_since_jump, cooldown,
                 )
                 return None
 
+        gap_same_dir = (
+            (odds_dir == Direction.DOWN and gap < 0) or
+            (odds_dir == Direction.UP   and gap > 0)
+        )
+
+        # ── 早期分钟分层拦截 ────────────────────────────────────────
+        if state.odds_jumped and minute <= 2:
+            if minute == 1:
+                # 分1：禁止 TWR=0.860（赔率 < 0.85）信号
+                # 数据：分1 整体胜率 73.1%，TWR=0.860 贡献大部分亏损
+                if odds_px < 0.85:
+                    logger.debug(
+                        "分1 赔率强信号拦截: odds=%.2f < 0.85 (TWR=0.860 胜率不足，禁止分1入场)",
+                        odds_px,
+                    )
+                    return None
+                # 分1 高赔率（≥0.85，TWR=0.968）：仍需跳变 + 高可信度
+                min_conf = 0.55
+                if signal_confidence < min_conf:
+                    logger.debug(
+                        "分1 高赔率信号拦截: conf=%.2f < %.2f",
+                        signal_confidence, min_conf,
+                    )
+                    return None
+
+            else:  # minute == 2
+                # 分2 UP：胜率 65%，要求 price<0.80 且 gap 同向 >= 0.15%
+                if odds_dir == Direction.UP:
+                    if odds_px >= 0.80 or not (gap_same_dir and abs(gap) >= 0.15):
+                        logger.debug(
+                            "分2 UP 信号拦截: odds=%.2f (需<0.80), gap=%.3f%% same=%s (需同向≥0.15%%)",
+                            odds_px, gap, gap_same_dir,
+                        )
+                        return None
+                # 分2 DOWN：维持原始门槛（胜率 90.5%）
+                else:
+                    min_gap_dn, min_odds_dn, min_conf_dn = 0.01, 0.75, 0.35
+                    gap_ok   = gap_same_dir and abs(gap) >= min_gap_dn
+                    odds_ok  = odds_px >= min_odds_dn
+                    conf_ok  = signal_confidence >= min_conf_dn
+                    if not ((gap_ok or odds_ok) and conf_ok):
+                        logger.debug(
+                            "分2 DOWN 信号拦截: gap=%.3f%% odds=%.2f conf=%.2f",
+                            gap, odds_px, signal_confidence,
+                        )
+                        return None
+
+                # 通用：低可信度时收紧
+                if signal_confidence < 0.35:
+                    logger.debug("分2 低可信度拦截: conf=%.2f", signal_confidence)
+                    return None
+
+        # ── 理论胜率 ────────────────────────────────────────────────
         # 路径2理论胜率：paper 交易验证赔率0.72~0.85区间实际胜率约86%，修正偏乐观的0.897
+        # TWR=0.860: 赔率 0.72~0.85，分3+ 实际胜率约 82%（分1/2 已拦截）
+        # TWR=0.968: 赔率 ≥ 0.85，分3+ 实际胜率约 84~100%
         theo_wr  = 0.860 if odds_px < 0.85 else 0.968
         ev       = theo_wr * (1 - odds_px) - (1 - theo_wr) * odds_px
         fee_frac = 0.25 * (odds_px * (1 - odds_px)) ** 2
         ev_fee   = ev - theo_wr * fee_frac
 
-        if ev < cfg.min_ev_threshold:
+        # ── P1：低置信度时提高 EV 门槛 ──────────────────────────────
+        # 实盘案例（04:38 Up $7.48 -$7.48）：conf=0.42（逆势），EV=0.085 仍触发下单
+        # 置信度 < 0.50 时，要求 EV ≥ 0.12（比正常门槛 0.08 高 50%）
+        LOW_CONF_EV_THRESH = 0.12
+        ev_threshold = LOW_CONF_EV_THRESH if signal_confidence < 0.50 else cfg.min_ev_threshold
+        if ev < ev_threshold:
+            if signal_confidence < 0.50:
+                logger.debug("低置信度 EV 拦截: conf=%.2f ev=%.4f < %.2f", signal_confidence, ev, ev_threshold)
             return None
 
-        kelly     = self._kelly(theo_wr, odds_px)
+        # ── P2：分3 高赔率（>0.85）双确认 ───────────────────────────
+        # 实盘案例（04:41 Down $7.92 -$7.92；05:43 Up $5.00 -$5.00）：
+        #   赔率0.88/0.885，分3，conf=0.69/0.52，最终反向结算
+        # 05:43 案例说明 conf=0.52（震荡市）不足以支撑高赔率下注，门槛提高至0.60
+        if minute >= 3 and odds_px > 0.85:
+            gap_ok  = gap_same_dir and abs(gap) >= 0.05
+            conf_ok = signal_confidence >= 0.60   # 从0.55提高到0.60
+            if not (gap_ok and conf_ok):
+                logger.debug(
+                    "分3高赔率双确认拦截: odds=%.2f gap=%.3f%%(same=%s) conf=%.2f (需gap同向≥0.05%%且conf≥0.60)",
+                    odds_px, gap, gap_same_dir, signal_confidence,
+                )
+                return None
+
+        # ── Kelly 注额：低赔率机会允许更高上限 ──────────────────────
+        kelly     = self._kelly_with_low_odds(theo_wr, odds_px)
         jump_note = "跳变+" if state.odds_jumped else ""
-        # 标注 gap 状态，方便事后分析
-        gap_same_dir = (
-            (odds_dir == Direction.DOWN and gap < 0) or
-            (odds_dir == Direction.UP   and gap > 0)
-        )
         if abs(gap) < 0.01:
             gap_note = "gap≈0"
         elif gap_same_dir:
@@ -323,6 +423,7 @@ class LateStageArbitrageStrategy:
             gap_note = f"gap反向{gap:+.3f}%⚠"
         sig = Signal(
             direction=odds_dir, token_id=token_id,
+            condition_id=market.condition_id,
             theoretical_win_rate=theo_wr, market_price=odds_px,
             ev_per_unit=ev, ev_after_fee=ev_fee, gap_pct=gap, gap_src=gap_src,
             seconds_remaining=secs_remaining, kelly_fraction=kelly,
@@ -359,6 +460,20 @@ class LateStageArbitrageStrategy:
             return 0.0
         kelly = (b * win_rate - (1 - win_rate)) / b
         return max(0.0, min(kelly * 0.5, cfg.max_bet_fraction))
+
+    @staticmethod
+    def _kelly_with_low_odds(win_rate: float, entry_price: float) -> float:
+        """
+        低赔率机会（market_price < low_odds_thresh）允许更高的 Kelly 上限。
+        数据依据：entry_price < 0.55 时实际胜率 96.4%（55/57 笔），可适度加仓。
+        """
+        b = (1 - entry_price) / entry_price
+        if b <= 0:
+            return 0.0
+        kelly = (b * win_rate - (1 - win_rate)) / b
+        # 低赔率机会用 high_conf_bet_fraction，否则用 max_bet_fraction
+        cap = cfg.high_conf_bet_fraction if entry_price < cfg.low_odds_thresh else cfg.max_bet_fraction
+        return max(0.0, min(kelly * 0.5, cap))
 
     @staticmethod
     def _adjust_for_orderbook(

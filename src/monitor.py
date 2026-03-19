@@ -149,22 +149,38 @@ class TelegramNotifier:
     # ── 格式化消息模板 ──
 
     def trade_opened(self, mode: str, direction: str, amount: float,
-                     entry_price: float, ev: float, gap: float):
+                     entry_price: float, ev: float, gap: float,
+                     capital: float = 0.0, wallet_usdc: float = 0.0):
         emoji = "🟢" if mode == "live" else "📝"
+        mode_str = "实盘" if mode == "live" else "纸面"
+        bal_line = ""
+        if mode == "live" and wallet_usdc > 0:
+            bal_line = f"\n💰 钱包余额: <b>${wallet_usdc:.2f} USDC.e</b>"
+        elif capital > 0:
+            bal_line = f"\n💰 账户资金: <b>${capital:.2f}</b>"
         return (
-            f"{emoji} <b>{'实盘' if mode=='live' else '纸面'}下单</b>\n"
+            f"{emoji} <b>{mode_str}下单</b>\n"
             f"方向: <b>{direction}</b>  金额: <b>${amount:.2f}</b>\n"
             f"入场价: {entry_price:.3f}  EV: {ev:+.4f}  gap: {gap:+.3f}%"
+            f"{bal_line}"
         )
 
     def trade_settled(self, mode: str, direction: str, result: str,
-                      pnl: float, win_rate: float, total_pnl: float):
-        won = direction == result
+                      pnl: float, win_rate: float, total_pnl: float,
+                      capital: float = 0.0, wallet_usdc: float = 0.0):
+        won = result == direction
         emoji = "✅" if won else "❌"
+        mode_str = "实盘" if mode == "live" else "纸面"
+        bal_line = ""
+        if mode == "live" and wallet_usdc > 0:
+            bal_line = f"\n💰 钱包余额: <b>${wallet_usdc:.2f} USDC.e</b>"
+        elif capital > 0:
+            bal_line = f"\n💰 账户资金: <b>${capital:.2f}</b>"
         return (
-            f"{emoji} <b>{'实盘' if mode=='live' else '纸面'}结算</b>\n"
-            f"方向: {direction}  结果: {result}  PnL: <b>{pnl:+.2f} USDC</b>\n"
+            f"{emoji} <b>{mode_str}结算</b>\n"
+            f"方向: {direction}  结果: <b>{result}</b>  PnL: <b>{pnl:+.2f} USDC</b>\n"
             f"累计 PnL: {total_pnl:+.2f}  历史胜率: {win_rate:.1%}"
+            f"{bal_line}"
         )
 
     def daily_summary(self, date: str, trades: int, wins: int, pnl: float):

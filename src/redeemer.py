@@ -17,7 +17,7 @@ Polymarket 官方 py-clob-client SDK 不提供 redeem 接口（Issue #139 截至
 
 import logging
 import time
-from typing import Optional
+from typing import Optional, Callable
 
 logger = logging.getLogger("redeemer")
 
@@ -65,11 +65,15 @@ class AutoRedeemer:
         signature_type: int = 0,
         retry_times: int = 3,
         retry_delay: float = 5.0,
+        notify_callback: Optional[Callable[[str], None]] = None,
+        get_balance_callback: Optional[Callable[[], float]] = None,
     ):
         self._available = _HAS_PM_APIS and bool(private_key) and bool(wallet_address)
         self._wallet    = wallet_address
         self._retry     = retry_times
         self._delay     = retry_delay
+        self._notify    = notify_callback        # fn(str) → None，发 Telegram 消息
+        self._get_bal   = get_balance_callback   # fn() → float，查链上 USDC.e 余额
 
         if not _HAS_PM_APIS:
             return
@@ -137,6 +141,7 @@ class AutoRedeemer:
                 logger.info("✅ 兑换成功 tx=%s", tx_hash[:16] + "…")
                 return RedeemResult(condition_id, True, tx_hash=tx_hash, amount=size)
 
+
             except Exception as e:
                 last_error = str(e)
                 logger.warning("兑换失败(第%d次): %s", attempt, last_error)
@@ -181,10 +186,26 @@ class AutoRedeemer:
                 neg_risk      = pos.negative_risk,
             )
             results.append(result)
+            title = getattr(pos, "title", pos.condition_id[:20]) or pos.condition_id[:20]
             if result.success:
-                logger.info("✅ 兑换成功: %s | 数量=%.4f", pos.title[:30], pos.size)
+                logger.info("✅ 兑换成功: %s | 数量=%.4f", title[:30], pos.size)
+                # 兑换成功后发 Telegram 通知（含钱包余额）
+                if self._notify:
+                    try:
+                        bal = self._get_bal() if self._get_bal else 0.0
+                        bal_line = f"\n💰 钱包余额: <b>${bal:.2f} USDC.e</b>" if bal > 0 else ""
+                        msg = (
+                            f"💵 <b>自动兑换成功</b>\n"
+                            f"市场: {title[:40]}\n"
+                            f"数量: <b>{pos.size:.4f}</b> shares\n"
+                            f"Tx: <code>{result.tx_hash[:20]}…</code>"
+                            f"{bal_line}"
+                        )
+                        self._notify(msg)
+                    except Exception as ne:
+                        logger.debug("兑换通知发送失败: %s", ne)
             else:
-                logger.error("❌ 兑换失败: %s | 错误=%s", pos.title[:30], result.error)
+                logger.error("❌ 兑换失败: %s | 错误=%s", title[:30], result.error)
             # 兑换之间稍作等待，避免触发链上 nonce 冲突
             time.sleep(1.0)
 
