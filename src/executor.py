@@ -341,7 +341,12 @@ class LiveExecutor:
             result = await loop.run_in_executor(None, self._do_place, signal, window_ts)
             return result
         except Exception as e:
-            logger.error("下单失败: %s", e)
+            err = str(e)
+            # 区分网络错误 vs API 拒绝，方便排查
+            if "Request exception" in err or "timeout" in err.lower() or "connection" in err.lower():
+                logger.error("下单失败（网络错误，已重试%d次）: %s", 3, err)
+            else:
+                logger.error("下单失败: %s", e)
             return None
 
     def _do_place(self, signal: Signal, window_ts: int) -> Optional[TradeRecord]:
@@ -370,18 +375,43 @@ class LiveExecutor:
                         size * signal.market_price)
         price = round(signal.market_price, 4)
 
-        resp = client.create_and_post_order(
-            OrderArgs(
-                token_id=signal.token_id,
-                price=price,
-                size=size,
-                side=BUY,
-            ),
-            options=PartialCreateOrderOptions(
-                tick_size=tick_size,
-                neg_risk=neg_risk,
-            ),
-        )
+        # 下单重试（最多3次，指数退避）
+        # 针对 "Request exception!" 这类网络抖动导致的临时失败
+        MAX_ATTEMPTS = 3
+        resp = None
+        last_exc = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                resp = client.create_and_post_order(
+                    OrderArgs(
+                        token_id=signal.token_id,
+                        price=price,
+                        size=size,
+                        side=BUY,
+                    ),
+                    options=PartialCreateOrderOptions(
+                        tick_size=tick_size,
+                        neg_risk=neg_risk,
+                    ),
+                )
+                last_exc = None
+                break  # 成功，跳出重试循环
+            except Exception as exc:
+                last_exc = exc
+                err_msg = str(exc)
+                # 仅对网络层错误重试；API 明确拒绝（余额不足/签名错误）不重试
+                api_rejection = any(k in err_msg for k in [
+                    "not enough balance", "invalid signature",
+                    "order is invalid", "minimum",
+                ])
+                if api_rejection or attempt == MAX_ATTEMPTS:
+                    raise
+                wait = 1.5 ** attempt  # 1.5s → 2.25s
+                logger.warning("下单第%d次失败（%.1fs后重试）: %s", attempt, wait, err_msg[:80])
+                time.sleep(wait)
+
+        if last_exc is not None:
+            raise last_exc
 
         order_id = resp.get("orderID") or resp.get("id", "unknown")
         status_ok = resp.get("status") in ("matched", "live", "delayed")
