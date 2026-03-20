@@ -379,11 +379,19 @@ class LateStageArbitrageStrategy:
                     logger.debug("分2 低可信度拦截: conf=%.2f", signal_confidence)
                     return None
 
-        # ── 理论胜率 ────────────────────────────────────────────────
-        # 路径2理论胜率：paper 交易验证赔率0.72~0.85区间实际胜率约86%，修正偏乐观的0.897
-        # TWR=0.860: 赔率 0.72~0.85，分3+ 实际胜率约 82%（分1/2 已拦截）
-        # TWR=0.968: 赔率 ≥ 0.85，分3+ 实际胜率约 84~100%
-        theo_wr  = 0.860 if odds_px < 0.85 else 0.968
+        # ── 路径2仅允许高赔率（≥0.85，TWR=0.968）────────────────────
+        # 实盘117笔累计数据（2026-03-19~20）：
+        #   TWR=0.860（odds 0.72~0.85）：真实胜率 66.7%，真实EV=-0.073，PnL=-23.67
+        #   TWR=0.968（odds ≥ 0.85）  ：真实胜率 87.0%，接近理论值，  PnL=-0.18
+        # 结论：低赔率区间（<0.85）的赔率强信号真实EV为负，禁止触发
+        if odds_px < 0.85:
+            logger.debug(
+                "路径2低赔率拦截: odds=%.3f < 0.85 (真实胜率66.7%%，实际EV为负，禁止入场)",
+                odds_px,
+            )
+            return None
+
+        theo_wr  = 0.968   # 仅剩 odds≥0.85 路径
         ev       = theo_wr * (1 - odds_px) - (1 - theo_wr) * odds_px
         fee_frac = 0.25 * (odds_px * (1 - odds_px)) ** 2
         ev_fee   = ev - theo_wr * fee_frac
@@ -407,18 +415,7 @@ class LateStageArbitrageStrategy:
                          ev, ev_threshold, signal_confidence, _local_hour)
             return None
 
-        # ── 分3+ UP方向低赔率(0.72~0.85)额外验证 ────────────────────
-        # 实盘数据（71笔）：UP方向TWR=0.860分3胜率仅50%（6/12），而DOWN方向91%（10/11）
-        # UP方向在低赔率区间存在系统性定价不准确，需要gap同向确认
-        if minute >= 3 and odds_dir == Direction.UP and odds_px < 0.85:
-            if not (gap_same_dir and abs(gap) >= 0.08):
-                logger.debug(
-                    "分3 UP低赔率额外验证拦截: odds=%.2f gap=%.3f%%(same=%s) (需gap同向≥0.08%%)",
-                    odds_px, gap, gap_same_dir,
-                )
-                return None
-
-        # ── P2：分3 高赔率（>0.85）双确认 ───────────────────────────
+        # ── 分3 高赔率（>0.85）双确认 ────────────────────────────────
         # 实盘案例（04:41 Down $7.92 -$7.92；05:43 Up $5.00 -$5.00）：
         #   赔率0.88/0.885，分3，conf=0.69/0.52，最终反向结算
         # 05:43 案例说明 conf=0.52（震荡市）不足以支撑高赔率下注，门槛提高至0.60
