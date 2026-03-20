@@ -563,6 +563,22 @@ class RiskManager:
             "cons_loss": self._consecutive_losses,
         }
 
+    def daily_reset(self, new_capital: float):
+        """
+        每日重置：用链上最新余额刷新资金基准，清空胜率统计和熔断状态。
+        保留 current_capital 的历史记录（通过 new_capital 传入）。
+        """
+        prev_stats = self.stats
+        self.initial_capital     = new_capital
+        self.current_capital     = new_capital
+        self._day_start_capital  = new_capital
+        self._day_start_ts       = self._today_ts()
+        self._consecutive_losses = 0
+        self._paused_until       = 0.0
+        self._total_trades       = 0
+        self._total_wins         = 0
+        return prev_stats   # 返回重置前的统计，供日报使用
+
     def _refresh_day(self):
         today = self._today_ts()
         if today > self._day_start_ts:

@@ -122,9 +122,10 @@ class PolymarketBot:
             sys.exit(1)
 
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(self.price_feed.run(),   name="price_feed")
-            tg.create_task(notifier.run(),          name="telegram")
-            tg.create_task(self._main_loop(),       name="main_loop")
+            tg.create_task(self.price_feed.run(),     name="price_feed")
+            tg.create_task(notifier.run(),            name="telegram")
+            tg.create_task(self._main_loop(),         name="main_loop")
+            tg.create_task(self._daily_reset_loop(),  name="daily_reset")
             tg.create_task(self._settlement_loop(), name="settlement")
 
     def stop(self, reason: str = "手动停止"):
@@ -404,6 +405,78 @@ class PolymarketBot:
             signal.market_price, signal.ev_per_unit, signal.gap_pct,
             capital=self.risk.current_capital, wallet_usdc=wallet_usdc,
         ))
+
+    # ── 每日重置循环 ──────────────────────────────────
+
+    async def _daily_reset_loop(self):
+        """
+        每天 23:59:59（北京时间）触发每日重置：
+          1. 发送日报（交易统计 + 胜率 + PnL）
+          2. 从链上读取最新 USDC.e 余额作为新一天的起始资金
+          3. 重置胜率、连续亏损计数、熔断状态
+          4. 若链上余额 < $5，发送余额不足告警
+        """
+        LOW_BALANCE_THRESHOLD = 5.0  # 余额低于此值发告警
+
+        while self._running:
+            # 计算距离今天 23:59:59 的剩余秒数（北京时间 = UTC+8）
+            now_local = datetime.now()
+            target    = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+            if now_local >= target:
+                # 已过今天的目标时间，等到明天
+                target = target.replace(day=target.day + 1)
+            secs_to_reset = (target - now_local).total_seconds()
+
+            logger.debug("每日重置倒计时: %.0f 秒（%s）", secs_to_reset, target.strftime("%m-%d %H:%M:%S"))
+            await asyncio.sleep(secs_to_reset)
+
+            if not self._running:
+                break
+
+            # ── 执行每日重置 ──
+            now_str   = now_local.strftime("%Y-%m-%d")
+            prev_stats = self.risk.stats
+
+            # 1. 获取链上最新余额（实盘查链上；paper 用当前资金）
+            loop = asyncio.get_event_loop()
+            if self.mode == "live" and cfg.has_wallet:
+                new_capital = await loop.run_in_executor(
+                    None, self.executor.get_wallet_usdc_balance
+                )
+                if new_capital <= 0:
+                    new_capital = self.risk.current_capital
+                    logger.warning("每日重置：链上余额查询失败，沿用当前资金 $%.2f", new_capital)
+            else:
+                new_capital = self.risk.current_capital
+
+            # 2. 发送日报
+            notifier.notify(notifier.daily_summary(
+                date        = now_str,
+                trades      = prev_stats["trades"],
+                wins        = prev_stats["wins"],
+                pnl         = prev_stats["pnl"],
+                new_capital = new_capital,
+            ))
+            logger.info(
+                "📊 日报 %s | 交易=%d 胜=%d 胜率=%.1f%% PnL=%+.2f | 新余额=$%.2f",
+                now_str, prev_stats["trades"], prev_stats["wins"],
+                self.risk.win_rate * 100, prev_stats["pnl"], new_capital,
+            )
+
+            # 3. 重置风控统计
+            self.risk.daily_reset(new_capital)
+            self.strategy.update_capital(new_capital)
+            self._risk_notified.clear()  # 清除风控通知去重记录
+            logger.info("✅ 每日重置完成 | 新资金=$%.2f | 胜率归零", new_capital)
+
+            # 4. 余额不足告警
+            if new_capital < LOW_BALANCE_THRESHOLD:
+                logger.warning("⚠️ 钱包余额 $%.2f < $%.0f 阈值，发送告警",
+                               new_capital, LOW_BALANCE_THRESHOLD)
+                notifier.notify(notifier.low_balance_alert(new_capital, LOW_BALANCE_THRESHOLD))
+
+            # 重置后等待 2 秒，避免跨越零点时重复触发
+            await asyncio.sleep(2)
 
     # ── 结算循环 ──────────────────────────────────────
 

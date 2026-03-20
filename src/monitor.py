@@ -198,14 +198,26 @@ class TelegramNotifier:
             f"{bal_line}"
         )
 
-    def daily_summary(self, date: str, trades: int, wins: int, pnl: float):
-        wr = wins / trades if trades else 0
+    def daily_summary(self, date: str, trades: int, wins: int, pnl: float,
+                      new_capital: float = 0.0):
+        wr    = wins / trades if trades else 0
         emoji = "📈" if pnl > 0 else "📉"
+        cap_line = f"\n💰 新一日余额: <b>${new_capital:.2f} USDC.e</b>" if new_capital > 0 else ""
         return (
             f"{self._header()}"
             f"{emoji} <b>日报 {date}</b>\n"
             f"交易: {trades}  胜: {wins}  胜率: {wr:.1%}\n"
             f"日收益: <b>{pnl:+.2f} USDC</b>"
+            f"{cap_line}"
+        )
+
+    def low_balance_alert(self, balance: float, threshold: float):
+        return (
+            f"{self._header()}"
+            f"🚨 <b>钱包余额不足</b>\n"
+            f"当前余额: <b>${balance:.2f} USDC.e</b>\n"
+            f"低于阈值 ${threshold:.0f}，请及时充值！\n"
+            f"bot 已暂停下单。"
         )
 
     def risk_alert(self, reason: str):
