@@ -93,6 +93,8 @@ class PolymarketBot:
         self._market_cache:  dict[str, object]      = {}
         self._running = False
         self._last_window_ts: Optional[int] = None
+        # 风控通知去重：记录已通知过的原因，避免每5s重复推送
+        self._risk_notified: set[str] = set()
 
         # 价格状态（跨 tick 共享）
         self._cl_last_price:     Optional[float] = None
@@ -295,7 +297,20 @@ class PolymarketBot:
         allowed, reason = self.risk.allow_trade()
         if not allowed:
             logger.warning("风控拦截: %s", reason)
+            # 同一原因只推送一次，窗口切换后重置（不频繁刷 Telegram）
+            notify_key = reason[:30]
+            if notify_key not in self._risk_notified:
+                self._risk_notified.add(notify_key)
+                notifier.notify(notifier.risk_alert(
+                    f"{reason}\n"
+                    f"账户资金: <b>${self.risk.current_capital:.2f}</b>  "
+                    f"已结算: {self.risk.stats['trades']}笔  "
+                    f"胜率: {self.risk.win_rate:.1%}"
+                ))
             return
+
+        # 风控通过时，清除同类通知记录（允许恢复后重新通知）
+        self._risk_notified.clear()
 
         # ── 11. 订单簿（仅路径3大gap时需要） ──
         orderbook = None
@@ -430,12 +445,25 @@ class PolymarketBot:
             pnl = await self.executor.settle(trade, result)
             win = (result == trade.direction)
             self.risk.record_result(win, pnl)
+            stats = self.risk.stats
             logger.info(
                 "%s 结算 | %s → %s | PnL=%+.2f | 胜率=%.1f%% | 总PnL=%+.2f",
                 "✅" if win else "❌",
                 trade.direction, result, pnl,
-                self.risk.win_rate * 100, self.risk.stats["pnl"],
+                self.risk.win_rate * 100, stats["pnl"],
             )
+
+            # 结算后立即检查是否触发风控阈值，若是则推送专项告警
+            allowed_after, risk_reason = self.risk.allow_trade()
+            if not allowed_after:
+                notifier.notify(notifier.risk_alert(
+                    f"{risk_reason}\n"
+                    f"账户资金: <b>${stats['capital']:.2f}</b>  "
+                    f"累计PnL: <b>{stats['pnl']:+.2f}</b>\n"
+                    f"交易: {stats['trades']}笔  胜率: {self.risk.win_rate:.1%}"
+                ))
+                # 加入已通知集合，避免后续每5s重复推送
+                self._risk_notified.add(risk_reason[:30])
             # 查链上余额（实盘才查）
             wallet_usdc_settle = 0.0
             if self.mode == "live":
@@ -530,9 +558,38 @@ class PolymarketBot:
 def parse_args():
     parser = argparse.ArgumentParser(description="Polymarket BTC 末期套利机器人")
     parser.add_argument("--mode",    choices=["paper", "live"], default=cfg.mode)
-    parser.add_argument("--capital", type=float, default=1000.0)
+    parser.add_argument("--capital", type=float, default=None,
+                        help="初始资金（paper模式默认1000；live模式默认自动读取链上USDC.e余额）")
     parser.add_argument("--debug",   action="store_true")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="跳过实盘启动确认（批量部署时使用）")
     return parser.parse_args()
+
+
+def _fetch_wallet_usdc_balance() -> float:
+    """从 Polygon 链上读取钱包 USDC.e 余额，失败返回 0.0。"""
+    try:
+        from web3 import Web3
+        USDC_E = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'
+        ERC20_ABI = [{"name": "balanceOf", "type": "function", "stateMutability": "view",
+                      "inputs": [{"name": "account", "type": "address"}],
+                      "outputs": [{"name": "", "type": "uint256"}]}]
+        proxy = os.environ.get("PROXY_URL", "").strip()
+        rpc_kwargs: dict = {"timeout": 8}
+        if proxy:
+            rpc_kwargs["proxies"] = {"http": proxy, "https": proxy}
+        w3 = Web3(Web3.HTTPProvider("https://polygon-bor.publicnode.com",
+                                    request_kwargs=rpc_kwargs))
+        usdc = w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_E), abi=ERC20_ABI
+        )
+        bal = usdc.functions.balanceOf(
+            Web3.to_checksum_address(cfg.wallet_address)
+        ).call()
+        return bal / 1e6  # USDC.e 6位小数
+    except Exception as e:
+        logger.warning("链上余额查询失败: %s", e)
+        return 0.0
 
 
 async def _run(mode: str, capital: float):
@@ -551,14 +608,29 @@ async def _run(mode: str, capital: float):
 
 
 def main():
-    args    = parse_args()
+    args = parse_args()
     setup_logging(logging.DEBUG if args.debug else logging.INFO)
-    mode    = args.mode
-    capital = args.capital
+    mode = args.mode
+
+    # ── 资金确定 ──
+    # live 模式：自动从链上读取 USDC.e 余额（可用 --capital 手动覆盖）
+    # paper 模式：默认 $1000（可用 --capital 指定）
+    if args.capital is not None:
+        capital = args.capital
+        capital_src = "手动指定"
+    elif mode == "live" and cfg.has_wallet:
+        capital = _fetch_wallet_usdc_balance()
+        capital_src = "链上余额"
+        if capital <= 0:
+            logger.error("链上 USDC.e 余额为 0 或查询失败，请手动指定 --capital 或充值钱包")
+            sys.exit(1)
+    else:
+        capital = 1000.0
+        capital_src = "默认值"
 
     logger.info("=" * 60)
     logger.info("  Polymarket BTC 末期套利 Bot  v3")
-    logger.info("  模式: %s  资金: $%.2f", mode.upper(), capital)
+    logger.info("  模式: %s  资金: $%.2f (%s)", mode.upper(), capital, capital_src)
     logger.info("  价格源: Chainlink链上 > CryptoCompare > Binance")
     logger.info("  赔率源: CLOB 实时订单簿(每%ds) > Gamma 初始值(备用)",
                 cfg.poll_interval_secs)
@@ -587,14 +659,18 @@ def main():
         if not cfg.has_wallet:
             logger.error("实盘模式需要在 .env 中配置 PRIVATE_KEY 和 WALLET_ADDRESS")
             sys.exit(1)
-        logger.warning("⚠️  实盘模式：将使用真实资金！")
-        try:
-            confirm = input("输入 YES 确认启动实盘: ").strip()
-            if confirm != "YES":
-                logger.info("已取消")
+        logger.warning("⚠️  实盘模式：将使用真实资金！钱包=%s  资金=$%.2f",
+                       cfg.wallet_address[:10] + "…", capital)
+        if not args.yes:
+            try:
+                confirm = input("输入 YES 确认启动实盘（或加 --yes 跳过此步骤）: ").strip()
+                if confirm != "YES":
+                    logger.info("已取消")
+                    sys.exit(0)
+            except (EOFError, KeyboardInterrupt):
                 sys.exit(0)
-        except (EOFError, KeyboardInterrupt):
-            sys.exit(0)
+        else:
+            logger.info("✅ --yes 模式，跳过确认，直接启动")
 
     asyncio.run(_run(mode, capital))
 
