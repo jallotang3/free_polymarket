@@ -392,11 +392,31 @@ class LateStageArbitrageStrategy:
         # 实盘案例（04:38 Up $7.48 -$7.48）：conf=0.42（逆势），EV=0.085 仍触发下单
         # 置信度 < 0.50 时，要求 EV ≥ 0.12（比正常门槛 0.08 高 50%）
         LOW_CONF_EV_THRESH = 0.12
-        ev_threshold = LOW_CONF_EV_THRESH if signal_confidence < 0.50 else cfg.min_ev_threshold
+        # 23时段（UTC+8 23:00~00:00）多空快速切换，实盘胜率仅33%，提高EV门槛至0.14
+        import time as _time
+        _local_hour = (_time.localtime().tm_hour)
+        VOLATILE_HOUR_EV_THRESH = 0.14
+        if _local_hour == 23:
+            ev_threshold = VOLATILE_HOUR_EV_THRESH
+        elif signal_confidence < 0.50:
+            ev_threshold = LOW_CONF_EV_THRESH
+        else:
+            ev_threshold = cfg.min_ev_threshold
         if ev < ev_threshold:
-            if signal_confidence < 0.50:
-                logger.debug("低置信度 EV 拦截: conf=%.2f ev=%.4f < %.2f", signal_confidence, ev, ev_threshold)
+            logger.debug("EV拦截: ev=%.4f < %.2f (conf=%.2f, hour=%dh)",
+                         ev, ev_threshold, signal_confidence, _local_hour)
             return None
+
+        # ── 分3+ UP方向低赔率(0.72~0.85)额外验证 ────────────────────
+        # 实盘数据（71笔）：UP方向TWR=0.860分3胜率仅50%（6/12），而DOWN方向91%（10/11）
+        # UP方向在低赔率区间存在系统性定价不准确，需要gap同向确认
+        if minute >= 3 and odds_dir == Direction.UP and odds_px < 0.85:
+            if not (gap_same_dir and abs(gap) >= 0.08):
+                logger.debug(
+                    "分3 UP低赔率额外验证拦截: odds=%.2f gap=%.3f%%(same=%s) (需gap同向≥0.08%%)",
+                    odds_px, gap, gap_same_dir,
+                )
+                return None
 
         # ── P2：分3 高赔率（>0.85）双确认 ───────────────────────────
         # 实盘案例（04:41 Down $7.92 -$7.92；05:43 Up $5.00 -$5.00）：
