@@ -14,6 +14,7 @@
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
@@ -236,6 +237,14 @@ class LiveExecutor:
 
         if not cfg.has_wallet:
             raise RuntimeError("实盘模式需要配置 PRIVATE_KEY 和 WALLET_ADDRESS")
+
+        # py-clob-client 内部使用 httpx，通过环境变量注入代理
+        # 必须在 ClobClient 初始化前设置，否则 httpx 不会读取
+        proxy = os.environ.get("PROXY_URL", "").strip()
+        if proxy:
+            os.environ["HTTPS_PROXY"] = proxy
+            os.environ["HTTP_PROXY"]  = proxy
+            logger.debug("httpx 代理已注入: %s", proxy)
 
         # 派生 L2 API 凭证
         temp = ClobClient(cfg.polymarket_host, key=cfg.private_key, chain_id=cfg.chain_id)
