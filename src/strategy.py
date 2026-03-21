@@ -20,7 +20,7 @@ logger = logging.getLogger("strategy")
 
 CL_FRESH_SECS      = 45
 BN_COUNTER_THRESH  = 0.08
-# STRONG_ODDS_THRESH 现在由 greed_params["min_odds_path2"] 动态提供
+STRONG_ODDS_THRESH = 0.72  # 路径1（跟赔率）的最低赔率门槛（固定，与贪婪指数无关）
 
 
 class Direction(str, Enum):
@@ -47,8 +47,10 @@ class Signal:
 
     @property
     def is_valid(self) -> bool:
+        # 使用贪婪指数的 min_ev（而非静态 min_ev_threshold），保持一致性
+        min_ev = cfg.greed_params["min_ev"]
         return (
-            self.ev_per_unit >= cfg.min_ev_threshold
+            self.ev_per_unit >= min_ev
             and self.market_price < self.theoretical_win_rate
             and self.kelly_fraction > 0
             and self.bet_amount >= 1.0
@@ -190,11 +192,17 @@ class LateStageArbitrageStrategy:
                     logger.debug("赔率不够强: %s=%.2f < %.2f", mkt_dir, mkt_price, STRONG_ODDS_THRESH)
                     return None
 
-                theo_wr  = 0.897 if mkt_price < 0.85 else 0.968
+                # 路径1理论胜率（与852窗口回测一致）
+                if mkt_price >= 0.85:
+                    theo_wr = 0.960
+                elif mkt_price >= 0.78:
+                    theo_wr = 0.920
+                else:
+                    theo_wr = 0.850
                 ev       = theo_wr * (1 - mkt_price) - (1 - theo_wr) * mkt_price
                 fee_frac = 0.25 * (mkt_price * (1 - mkt_price)) ** 2
                 ev_fee   = ev - theo_wr * fee_frac
-                if ev > cfg.min_ev_threshold:
+                if ev > cfg.greed_params["min_ev"]:
                     direction = Direction.UP if mkt_up_dom else Direction.DOWN
                     token_id  = market.up_token if mkt_up_dom else market.down_token
                     kelly     = self._kelly_with_low_odds(theo_wr, mkt_price)
@@ -254,7 +262,7 @@ class LateStageArbitrageStrategy:
         fee_frac = 0.25 * (market_price * (1 - market_price)) ** 2
         ev_fee   = ev - theo_wr * fee_frac
 
-        if ev < cfg.min_ev_threshold:
+        if ev < gp_path3["min_ev"]:
             return None
 
         if orderbook is not None:
@@ -396,8 +404,7 @@ class LateStageArbitrageStrategy:
         ev_fee   = ev - theo_wr * fee_frac
 
         # ── EV 门槛（贪婪指数动态 + 低conf/高波动时段修正）──
-        import time as _time
-        _local_hour = _time.localtime().tm_hour
+        _local_hour = time.localtime().tm_hour
         base_ev      = gp["min_ev"]
         LOW_CONF_EV  = base_ev * 1.5
         VOLATILE_EV  = base_ev * 1.75
