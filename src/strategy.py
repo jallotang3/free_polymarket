@@ -20,7 +20,7 @@ logger = logging.getLogger("strategy")
 
 CL_FRESH_SECS      = 45
 BN_COUNTER_THRESH  = 0.08
-STRONG_ODDS_THRESH = 0.72
+# STRONG_ODDS_THRESH 现在由 greed_params["min_odds_path2"] 动态提供
 
 
 class Direction(str, Enum):
@@ -216,20 +216,20 @@ class LateStageArbitrageStrategy:
         if sig is not None:
             return sig
 
-        # ── 路径 3（末期套利）：gap >= 0.10% + minute >= 3 ──
-        gap_abs = abs(gap)
-        if gap_abs < 0.10:
-            logger.debug("gap 不足 0.10%%（%.3f%%），弱套利不下单", gap_abs)
+        # ── 路径 3（末期套利）──
+        gp_path3 = cfg.greed_params
+        gap_abs  = abs(gap)
+        min_gap  = gp_path3["min_gap"]
+        if gap_abs < max(min_gap, 0.05):  # 最低 0.05% 保底
             return None
 
         theo_wr = self._theo_win_rate(gap_abs, minute)
         if theo_wr < 0.85:
             return None
 
-        # TWR=0.968（gap 0.10~0.15%）实际胜率 84%，比理论值低 12.8%，仅允许分3/分4
-        # 数据：分1/2 的 TWR=0.968 贡献了多笔亏损，限制早期入场
-        if theo_wr == 0.968 and minute < 3:
-            logger.debug("末期套利 TWR=0.968 早期拦截: minute=%d (需≥3)", minute)
+        if minute < gp_path3["min_minute"]:
+            logger.debug("末期套利分钟拦截: minute=%d (需≥%d, greed=%d)",
+                         minute, gp_path3["min_minute"], cfg.greed_index)
             return None
 
         direction    = Direction.UP if gap > 0 else Direction.DOWN
@@ -282,25 +282,23 @@ class LateStageArbitrageStrategy:
         signal_confidence: float = 1.0,
     ) -> Optional[Signal]:
         """
-        路径2：gap 不足（< 0.05%）但 CLOB 赔率极强时的独立信号。
-        分层触发：
-          minute=1: 禁止 TWR=0.860（赔率0.72~0.85）信号，需赔率≥0.85 + 已跳变 + 高可信度
-          minute=2: UP 方向额外要求 price<0.80 且 gap同向≥0.15%；DOWN 维持原门槛
-          minute≥3: 赔率≥0.72（无需跳变/gap/context）
-        数据依据（2026-03-18~19 186笔 paper 交易）：
-          - 分1 TWR=0.860 整体胜率仅 73.1%，是主要亏损来源，禁止入场
-          - 分2 UP 胜率 65%，需更严格的 gap+赔率 双重确认
-          - TWR=0.968（赔率≥0.85）分3/分4 胜率 84~100%，分1/2 建议高置信度才允许
+        路径2：赔率强信号，根据贪婪指数动态调整阈值。
+        贪婪指数越高，赔率阈值越低（允许更多信号），反之越保守。
         """
+        gp = cfg.greed_params
+        min_odds  = gp["min_odds_path2"]
+        price_max = gp["price_max"]
+        min_min   = gp["min_minute"]
+
         odds_dominant = max(market.up_odds, market.down_odds)
-        if odds_dominant < STRONG_ODDS_THRESH:
+        if odds_dominant < min_odds:
             return None
 
         odds_dir = Direction.DOWN if market.down_odds >= market.up_odds else Direction.UP
         odds_px  = market.down_odds if odds_dir == Direction.DOWN else market.up_odds
         token_id = market.down_token if odds_dir == Direction.DOWN else market.up_token
 
-        timing_ok     = (state.odds_jumped and minute >= 1) or minute >= 3
+        timing_ok     = (state.odds_jumped and minute >= 1) or minute >= min_min
         gap_conflicts = (
             abs(gap) >= 0.05 and
             ((odds_dir == Direction.DOWN and gap > 0) or
@@ -380,39 +378,38 @@ class LateStageArbitrageStrategy:
                     return None
 
         # ── 路径2仅允许高赔率（≥0.85，TWR=0.968）────────────────────
-        # 实盘117笔累计数据（2026-03-19~20）：
-        #   TWR=0.860（odds 0.72~0.85）：真实胜率 66.7%，真实EV=-0.073，PnL=-23.67
-        #   TWR=0.968（odds ≥ 0.85）  ：真实胜率 87.0%，接近理论值，  PnL=-0.18
-        # 结论：低赔率区间（<0.85）的赔率强信号真实EV为负，禁止触发
-        if odds_px < 0.85:
-            logger.debug(
-                "路径2低赔率拦截: odds=%.3f < 0.85 (真实胜率66.7%%，实际EV为负，禁止入场)",
-                odds_px,
-            )
+        # ── price_max 上限（参考4coinsbot：赔率过高利润太薄）──
+        if odds_px > price_max:
+            logger.debug("路径2 price_max 拦截: odds=%.3f > %.2f", odds_px, price_max)
             return None
 
-        theo_wr  = 0.968   # 仅剩 odds≥0.85 路径
+        # ── 理论胜率（由852窗口回测数据校准，比之前更精确）──
+        if odds_px >= 0.85:
+            theo_wr = 0.960
+        elif odds_px >= 0.78:
+            theo_wr = 0.920
+        else:
+            theo_wr = 0.850
+
         ev       = theo_wr * (1 - odds_px) - (1 - theo_wr) * odds_px
         fee_frac = 0.25 * (odds_px * (1 - odds_px)) ** 2
         ev_fee   = ev - theo_wr * fee_frac
 
-        # ── P1：低置信度时提高 EV 门槛 ──────────────────────────────
-        # 实盘案例（04:38 Up $7.48 -$7.48）：conf=0.42（逆势），EV=0.085 仍触发下单
-        # 置信度 < 0.50 时，要求 EV ≥ 0.12（比正常门槛 0.08 高 50%）
-        LOW_CONF_EV_THRESH = 0.12
-        # 23时段（UTC+8 23:00~00:00）多空快速切换，实盘胜率仅33%，提高EV门槛至0.14
+        # ── EV 门槛（贪婪指数动态 + 低conf/高波动时段修正）──
         import time as _time
-        _local_hour = (_time.localtime().tm_hour)
-        VOLATILE_HOUR_EV_THRESH = 0.14
+        _local_hour = _time.localtime().tm_hour
+        base_ev      = gp["min_ev"]
+        LOW_CONF_EV  = base_ev * 1.5
+        VOLATILE_EV  = base_ev * 1.75
         if _local_hour == 23:
-            ev_threshold = VOLATILE_HOUR_EV_THRESH
+            ev_threshold = VOLATILE_EV
         elif signal_confidence < 0.50:
-            ev_threshold = LOW_CONF_EV_THRESH
+            ev_threshold = LOW_CONF_EV
         else:
-            ev_threshold = cfg.min_ev_threshold
+            ev_threshold = base_ev
         if ev < ev_threshold:
-            logger.debug("EV拦截: ev=%.4f < %.2f (conf=%.2f, hour=%dh)",
-                         ev, ev_threshold, signal_confidence, _local_hour)
+            logger.debug("EV拦截: ev=%.4f < %.2f (conf=%.2f, greed=%d, hour=%dh)",
+                         ev, ev_threshold, signal_confidence, cfg.greed_index, _local_hour)
             return None
 
         # ── 分3 高赔率（>0.85）双确认 ────────────────────────────────

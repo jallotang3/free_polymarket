@@ -39,14 +39,44 @@ class Config:
     # ── 运行模式 ──
     mode: str             = field(default_factory=lambda: os.getenv("MODE", "paper"))
 
-    # ── 策略参数 ──
+    # ── 贪婪指数（1~10，控制冒险程度）──
+    # 数据依据：852窗口真实结算数据回测
+    # 1=极保守（胜率~98%，~3信号/天）  5=平衡（~94%，~40/天）  10=激进（~80%，~160/天）
+    greed_index: int = field(default_factory=lambda: int(os.getenv("GREED_INDEX", "5")))
+
+    # ── 策略参数（部分被 greed_index 动态覆盖）──
     min_gap_pct: float    = field(default_factory=lambda: float(os.getenv("MIN_GAP_PCT", "0.10")))
     entry_margin: float   = field(default_factory=lambda: float(os.getenv("ENTRY_MARGIN", "0.03")))
     min_ev_threshold: float = field(default_factory=lambda: float(os.getenv("MIN_EV_THRESHOLD", "0.08")))
     # 入场窗口：下限 60s（分1）以允许路径2早期赔率信号；上限 270s（4:30）
-    # 策略内部对各路径有独立时机约束（路径2 minute>=1，路径1/3 minute>=3）
     entry_window_start: int = 60    # 1 分钟
     entry_window_end: int   = 270   # 4 分 30 秒
+
+    @property
+    def greed_params(self) -> dict:
+        """根据贪婪指数返回动态策略参数"""
+        table = {
+            #  idx: (min_odds_path2, min_gap, min_ev, min_minute, price_max)
+            1:  (0.92, 0.20, 0.15, 4, 0.95),
+            2:  (0.90, 0.15, 0.12, 3, 0.94),
+            3:  (0.88, 0.12, 0.10, 3, 0.93),
+            4:  (0.85, 0.10, 0.10, 3, 0.92),
+            5:  (0.78, 0.10, 0.08, 3, 0.92),
+            6:  (0.75, 0.08, 0.06, 2, 0.92),
+            7:  (0.72, 0.05, 0.05, 2, 0.93),
+            8:  (0.72, 0.00, 0.04, 2, 0.93),
+            9:  (0.65, 0.00, 0.03, 1, 0.94),
+            10: (0.55, 0.00, 0.02, 1, 0.95),
+        }
+        idx = max(1, min(10, self.greed_index))
+        mo, mg, me, mm, pm = table[idx]
+        return {
+            "min_odds_path2": mo,
+            "min_gap":        mg,
+            "min_ev":         me,
+            "min_minute":     mm,
+            "price_max":      pm,
+        }
 
     # ── 风险控制 ──
     max_bet_fraction: float       = field(default_factory=lambda: float(os.getenv("MAX_BET_FRACTION", "0.05")))

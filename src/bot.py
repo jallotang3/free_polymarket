@@ -711,9 +711,10 @@ def main():
         logger.info("  历史背景: MarketContext（90m趋势/波动率，参与信号过滤）")
     else:
         logger.info("  历史背景: 未加载（MarketContext 不可用）")
+    gp = cfg.greed_params
     logger.info("  信号路径: 路径1(跟赔率) | 路径2(赔率强信号) | 路径3(末期套利)")
-    logger.info("  入场窗口: %ds ~ %ds | 最小EV: %.2f",
-                cfg.entry_window_start, cfg.entry_window_end, cfg.min_ev_threshold)
+    logger.info("  贪婪指数: %d/10 | 赔率下限: %.2f | gap下限: %.2f%% | EV下限: %.2f",
+                cfg.greed_index, gp["min_odds_path2"], gp["min_gap"], gp["min_ev"])
     logger.info("=" * 60)
 
     if mode == "live":
