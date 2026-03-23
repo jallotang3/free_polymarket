@@ -21,6 +21,8 @@ logger = logging.getLogger("strategy")
 CL_FRESH_SECS      = 45
 BN_COUNTER_THRESH  = 0.08
 STRONG_ODDS_THRESH = 0.72  # 路径1（跟赔率）的最低赔率门槛（固定，与贪婪指数无关）
+# 路径2：距收盘过短时盘口噪声大（实盘 2026-03-21 #325 剩余31s 巨震后反向）
+PATH2_MIN_SECS_REMAINING = 40
 
 
 class Direction(str, Enum):
@@ -132,6 +134,7 @@ class LateStageArbitrageStrategy:
         bn_gap: Optional[float] = None,
         ptb_delay_secs: int = 0,
         signal_confidence: float = 1.0,
+        vol_level: str = "medium",  # 新增：波动率等级
     ) -> Optional[Signal]:
         state = self.get_window_state(window_ts)
 
@@ -220,7 +223,7 @@ class LateStageArbitrageStrategy:
         # ── 路径 2（赔率强信号）：gap 不足但赔率极强 ──
         # 适用：CL gap < 0.05% 但 CLOB 赔率已明确指向一侧
         # 触发：赔率单边 >= 0.72 + (已跳变+min>=1) 或 min>=3
-        sig = self._eval_odds_only(state, market, gap, gap_src, minute, secs_remaining, signal_confidence)
+        sig = self._eval_odds_only(state, market, gap, gap_src, minute, secs_remaining, signal_confidence, vol_level)
         if sig is not None:
             return sig
 
@@ -288,10 +291,16 @@ class LateStageArbitrageStrategy:
         self, state: WindowState, market: MarketInfo,
         gap: float, gap_src: str, minute: int, secs_remaining: int,
         signal_confidence: float = 1.0,
+        vol_level: str = "medium",  # 新增：波动率等级（从 market_context 传入）
     ) -> Optional[Signal]:
         """
         路径2：赔率强信号，根据贪婪指数动态调整阈值。
         贪婪指数越高，赔率阈值越低（允许更多信号），反之越保守。
+
+        优化（2026-03-23）：
+          - 低波动环境提高赔率门槛至0.85
+          - 震荡市（conf<0.55）要求赔率≥0.85或gap≥0.10%
+          - 分3高赔率gap门槛从0.05提高到0.10
         """
         gp = cfg.greed_params
         min_odds  = gp["min_odds_path2"]
@@ -313,6 +322,23 @@ class LateStageArbitrageStrategy:
              (odds_dir == Direction.UP   and gap < 0))
         )
         if not timing_ok or gap_conflicts:
+            return None
+
+        if secs_remaining < PATH2_MIN_SECS_REMAINING:
+            logger.debug(
+                "路径2 剩余时间过短: %ds < %ds",
+                secs_remaining, PATH2_MIN_SECS_REMAINING,
+            )
+            return None
+
+        # ── P0优化1：低波动环境提高赔率门槛 ──────────────────────────
+        # 数据依据：实盘亏损单中80%发生在"波动↓"环境
+        # 低波动时，路径2最低赔率从0.78提高到0.85
+        if vol_level == "low" and odds_px < 0.85:
+            logger.debug(
+                "低波动环境拦截: vol=%s odds=%.2f < 0.85",
+                vol_level, odds_px,
+            )
             return None
 
         # ── P1：跳变冷却期 ──────────────────────────────────────────
@@ -337,6 +363,17 @@ class LateStageArbitrageStrategy:
             (odds_dir == Direction.DOWN and gap < 0) or
             (odds_dir == Direction.UP   and gap > 0)
         )
+
+        # ── P0优化2：震荡市双确认加强 ──────────────────────────────
+        # 数据依据：实盘#326/#327在震荡市（conf=0.48）下单后反向
+        # 震荡市（conf<0.55）要求：赔率≥0.85 或 gap同向≥0.10%
+        if minute <= 3 and signal_confidence < 0.55:
+            if odds_px < 0.85 and not (gap_same_dir and abs(gap) >= 0.10):
+                logger.debug(
+                    "震荡市拦截: conf=%.2f odds=%.2f gap=%.3f%% (需赔率≥0.85或gap同向≥0.10%%)",
+                    signal_confidence, odds_px, gap,
+                )
+                return None
 
         # ── 早期分钟分层拦截 ────────────────────────────────────────
         if state.odds_jumped and minute <= 2:
@@ -369,7 +406,12 @@ class LateStageArbitrageStrategy:
                         return None
                 # 分2 DOWN：维持原始门槛（胜率 90.5%）
                 else:
-                    min_gap_dn, min_odds_dn, min_conf_dn = 0.01, 0.75, 0.35
+                    min_gap_dn, min_odds_dn = 0.01, 0.75
+                    # 默认 conf≥0.35；若赔率≥0.85 且 gap 与 Down 同向，可放宽至 0.28
+                    # （保留 02:32 高赔率 Down 成功案例，同时拦截 0.79/#326 类弱势逆势单）
+                    min_conf_dn = (
+                        0.28 if (odds_px >= 0.85 and gap_same_dir) else 0.35
+                    )
                     gap_ok   = gap_same_dir and abs(gap) >= min_gap_dn
                     odds_ok  = odds_px >= min_odds_dn
                     conf_ok  = signal_confidence >= min_conf_dn
@@ -403,32 +445,40 @@ class LateStageArbitrageStrategy:
         fee_frac = 0.25 * (odds_px * (1 - odds_px)) ** 2
         ev_fee   = ev - theo_wr * fee_frac
 
-        # ── EV 门槛（贪婪指数动态 + 低conf/高波动时段修正）──
+        # ── P1优化：EV 门槛动态调整 ──────────────────────────────
+        # 根据市场环境动态调整EV门槛：
+        #   - 低波动环境：EV门槛×2（数据：80%亏损单发生在低波动）
+        #   - 低可信度（<0.50）：EV门槛×1.5
+        #   - 23点高波动时段：EV门槛×1.75
         _local_hour = time.localtime().tm_hour
         base_ev      = gp["min_ev"]
-        LOW_CONF_EV  = base_ev * 1.5
-        VOLATILE_EV  = base_ev * 1.75
-        if _local_hour == 23:
-            ev_threshold = VOLATILE_EV
+
+        if vol_level == "low":
+            ev_threshold = base_ev * 2.0  # 低波动：最严格
+        elif _local_hour == 23:
+            ev_threshold = base_ev * 1.75  # 23点高波动
         elif signal_confidence < 0.50:
-            ev_threshold = LOW_CONF_EV
+            ev_threshold = base_ev * 1.5  # 低可信度
         else:
             ev_threshold = base_ev
+
         if ev < ev_threshold:
-            logger.debug("EV拦截: ev=%.4f < %.2f (conf=%.2f, greed=%d, hour=%dh)",
-                         ev, ev_threshold, signal_confidence, cfg.greed_index, _local_hour)
+            logger.debug(
+                "EV拦截: ev=%.4f < %.4f (vol=%s conf=%.2f greed=%d hour=%dh)",
+                ev, ev_threshold, vol_level, signal_confidence, cfg.greed_index, _local_hour
+            )
             return None
 
-        # ── 分3 高赔率（>0.85）双确认 ────────────────────────────────
-        # 实盘案例（04:41 Down $7.92 -$7.92；05:43 Up $5.00 -$5.00）：
-        #   赔率0.88/0.885，分3，conf=0.69/0.52，最终反向结算
-        # 05:43 案例说明 conf=0.52（震荡市）不足以支撑高赔率下注，门槛提高至0.60
+        # ── P0优化3：分3高赔率双确认加强 ────────────────────────────
+        # 实盘案例（#319 Up@0.78 gap+0.02% -$4.95；#325 Down@0.785 gap-0.01% -$3.92）：
+        #   赔率0.78~0.88，分3，gap≈0，最终反向结算
+        # 优化：gap门槛从0.05提高到0.10，conf门槛从0.55提高到0.60
         if minute >= 3 and odds_px > 0.85:
-            gap_ok  = gap_same_dir and abs(gap) >= 0.05
-            conf_ok = signal_confidence >= 0.60   # 从0.55提高到0.60
+            gap_ok  = gap_same_dir and abs(gap) >= 0.10  # 从0.05提高到0.10
+            conf_ok = signal_confidence >= 0.60
             if not (gap_ok and conf_ok):
                 logger.debug(
-                    "分3高赔率双确认拦截: odds=%.2f gap=%.3f%%(same=%s) conf=%.2f (需gap同向≥0.05%%且conf≥0.60)",
+                    "分3高赔率双确认拦截: odds=%.2f gap=%.3f%%(same=%s) conf=%.2f (需gap同向≥0.10%%且conf≥0.60)",
                     odds_px, gap, gap_same_dir, signal_confidence,
                 )
                 return None

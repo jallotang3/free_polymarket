@@ -246,25 +246,10 @@ class PolymarketBot:
             try:
                 res_up     = self.mc.signal_confidence("UP",   primary_gap, minute)
                 res_dn     = self.mc.signal_confidence("DOWN", primary_gap, minute)
+                # 策略只用「原始」可信度，不再做 0.55 抬升：
+                # 抬升会让分2 逆势 Down（如 2026-03-21 实盘 #326/#327）绕过 min_conf=0.35，放大亏损。
                 mc_conf_up = res_up["score"]
                 mc_conf_dn = res_dn["score"]
-
-                # 数据修正：趋势与赔率反向时胜率反而更高（95.8% vs 91.1%）
-                # 原因：赔率已超前反应方向，趋势"滞后"于市场定价
-                # 修正：当赔率方向与趋势反向时，conf 取 max(原值, 0.55) 避免被误杀
-                dom_is_up = clob_up >= clob_dn
-                trend_score = getattr(self.mc.get_context() or {}, 'get', lambda k,v: v)('trend_30m', 0)
-                ctx = self.mc.get_context()
-                if ctx:
-                    t30 = ctx.get('trend_30m', 0) or 0
-                    # 赔率 Up 主导但趋势偏下 → 反向（赔率提前定价），conf 不惩罚
-                    if dom_is_up and t30 < -0.1 and mc_conf_up < 0.55:
-                        mc_conf_up = max(mc_conf_up, 0.55)
-                        logger.debug("conf修正(UP反向趋势): %.2f → %.2f", res_up['score'], mc_conf_up)
-                    # 赔率 Down 主导但趋势偏上 → 反向，同上
-                    elif not dom_is_up and t30 > 0.1 and mc_conf_dn < 0.55:
-                        mc_conf_dn = max(mc_conf_dn, 0.55)
-                        logger.debug("conf修正(DOWN反向趋势): %.2f → %.2f", res_dn['score'], mc_conf_dn)
 
                 # 心跳日志用：取赔率主导方向的上下文
                 dominant_note_dir = "UP" if clob_up >= clob_dn else "DOWN"
@@ -325,6 +310,16 @@ class PolymarketBot:
         dominant_dir       = "UP" if clob_up >= clob_dn else "DOWN"
         signal_confidence  = mc_conf_up if dominant_dir == "UP" else mc_conf_dn
 
+        # 提取波动率等级（用于路径2优化）
+        vol_level = "medium"
+        if self.mc is not None:
+            try:
+                ctx = self.mc.get_context()
+                if ctx:
+                    vol_level = ctx.get("vol_level", "medium")
+            except Exception:
+                pass
+
         # ── 12. 评估信号 ──
         signal = self.strategy.evaluate(
             window_ts          = window_ts,
@@ -337,6 +332,7 @@ class PolymarketBot:
             bn_gap             = bn_gap_pct,
             ptb_delay_secs     = ptb_delay,
             signal_confidence  = signal_confidence,
+            vol_level          = vol_level,
         )
 
         if signal is None or not signal.is_valid:

@@ -224,7 +224,8 @@ class MarketContext:
 
         trend_30m = ctx["trend_30m"]
         vol_level = ctx["vol_level"]
-        signal_up = (signal_dir == "UP")
+        # 兼容 bot 传入的 "Up"/"Down"（Enum）与 "UP"/"DOWN"
+        signal_up = signal_dir.upper() == "UP"
 
         # ── 趋势一致性 ──
         # 趋势值 > +0.15 视为上涨，< -0.15 视为下跌，其余视为震荡
