@@ -229,7 +229,11 @@ class LiveExecutor:
 
     def sweep_usdc(self, balance: float) -> tuple[bool, float, str]:
         """
-        资金归集：将超出阈值部分的指定比例转账到归集钱包。
+        资金归集：余额达到阈值时，转出 阈值 × 比例 到归集钱包。
+
+        计算规则：
+            转出金额 = sweep_threshold × sweep_ratio（固定金额）
+            例：余额=$120，阈值=$50，比例=0.8 → 转出 50×0.8=$40，保留$80
 
         参数:
             balance: 当前链上余额（USDC）
@@ -241,12 +245,11 @@ class LiveExecutor:
         if not cfg.has_sweep:
             return False, 0.0, "归集未配置"
 
-        # 计算转账金额：超出阈值部分 × 归集比例
-        excess = balance - cfg.sweep_threshold
-        if excess <= 0:
-            return False, 0.0, f"余额 ${balance:.2f} 未超过阈值 ${cfg.sweep_threshold:.2f}"
+        if balance < cfg.sweep_threshold:
+            return False, 0.0, f"余额 ${balance:.2f} 未达到阈值 ${cfg.sweep_threshold:.2f}"
 
-        amount = round(excess * cfg.sweep_ratio, 2)
+        # 转出金额固定为：阈值 × 比例
+        amount = round(cfg.sweep_threshold * cfg.sweep_ratio, 2)
         if amount < 1.0:
             return False, 0.0, f"归集金额 ${amount:.2f} 过小（<$1），跳过"
 
