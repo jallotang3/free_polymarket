@@ -584,6 +584,15 @@ class RiskManager:
             return False, "资金不足初始的 10%"
         return True, "ok"
 
+    def sweep_capital(self, amount_swept: float):
+        """
+        资金归集后同步资金基准。
+        同时更新 current_capital 和 _day_start_capital，
+        避免归集导致 day_loss 虚高触发熔断。
+        """
+        self.current_capital    -= amount_swept
+        self._day_start_capital -= amount_swept
+
     def record_result(self, win: bool, pnl: float):
         self.current_capital += pnl
         self._total_trades   += 1

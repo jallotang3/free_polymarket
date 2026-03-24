@@ -93,6 +93,24 @@ class Config:
     max_consecutive_losses: int   = 5
     pause_after_loss_minutes: int = 60
 
+    # ── 资金归集 ──
+    # 归集钱包地址（留空则禁用归集功能）
+    sweep_wallet: str         = field(default_factory=lambda: os.getenv("SWEEP_WALLET", ""))
+    # 触发归集的余额阈值（USDC），余额超过此值时执行归集
+    sweep_threshold: float    = field(default_factory=lambda: float(os.getenv("SWEEP_THRESHOLD", "0")))
+    # 归集比例（0.0~1.0），达到阈值后将多出部分的此比例转出
+    # 例：余额100，阈值50，比例0.8 → 转出 (100-50)*0.8 = 40 USDC
+    sweep_ratio: float        = field(default_factory=lambda: float(os.getenv("SWEEP_RATIO", "0.8")))
+
+    @property
+    def has_sweep(self) -> bool:
+        """是否启用资金归集"""
+        return bool(
+            self.sweep_wallet
+            and self.sweep_threshold > 0
+            and 0 < self.sweep_ratio <= 1.0
+        )
+
     # ── 数据采集 ──
     poll_interval_secs: int = 5
     db_path: str            = field(default_factory=lambda: str(_root / "data" / "observations.db"))

@@ -227,6 +227,81 @@ class LiveExecutor:
             logger.debug("查询链上余额失败: %s", e)
             return 0.0
 
+    def sweep_usdc(self, balance: float) -> tuple[bool, float, str]:
+        """
+        资金归集：将超出阈值部分的指定比例转账到归集钱包。
+
+        参数:
+            balance: 当前链上余额（USDC）
+
+        返回:
+            (success, amount_sent, tx_hash)
+            失败时 success=False, amount_sent=0, tx_hash=错误信息
+        """
+        if not cfg.has_sweep:
+            return False, 0.0, "归集未配置"
+
+        # 计算转账金额：超出阈值部分 × 归集比例
+        excess = balance - cfg.sweep_threshold
+        if excess <= 0:
+            return False, 0.0, f"余额 ${balance:.2f} 未超过阈值 ${cfg.sweep_threshold:.2f}"
+
+        amount = round(excess * cfg.sweep_ratio, 2)
+        if amount < 1.0:
+            return False, 0.0, f"归集金额 ${amount:.2f} 过小（<$1），跳过"
+
+        try:
+            from web3 import Web3
+        except ImportError:
+            return False, 0.0, "web3 未安装"
+
+        try:
+            if self._w3 is None or not self._w3.is_connected():
+                proxy = os.environ.get("PROXY_URL", "").strip()
+                rpc_kwargs = {'timeout': 10}
+                if proxy:
+                    rpc_kwargs['proxies'] = {'http': proxy, 'https': proxy}
+                self._w3 = Web3(Web3.HTTPProvider(
+                    'https://polygon-bor.publicnode.com',
+                    request_kwargs=rpc_kwargs,
+                ))
+
+            USDC_E = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'
+            ERC20_ABI = [
+                {"name": "transfer", "type": "function", "stateMutability": "nonpayable",
+                 "inputs": [{"name": "to", "type": "address"}, {"name": "amount", "type": "uint256"}],
+                 "outputs": [{"name": "", "type": "bool"}]},
+            ]
+            w3 = self._w3
+            wallet  = Web3.to_checksum_address(cfg.wallet_address)
+            to_addr = Web3.to_checksum_address(cfg.sweep_wallet)
+            usdc    = w3.eth.contract(address=Web3.to_checksum_address(USDC_E), abi=ERC20_ABI)
+            amount_raw = int(amount * 1e6)  # USDC.e 6位小数
+
+            nonce  = w3.eth.get_transaction_count(wallet)
+            gas_px = w3.eth.gas_price
+            tx = usdc.functions.transfer(to_addr, amount_raw).build_transaction({
+                'from': wallet, 'nonce': nonce,
+                'gas': 80_000, 'gasPrice': gas_px, 'chainId': 137,
+            })
+            signed  = w3.eth.account.sign_transaction(tx, cfg.private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+            if receipt.status == 1:
+                logger.info(
+                    "💸 资金归集成功: $%.2f USDC → %s (tx: %s)",
+                    amount, cfg.sweep_wallet[:10] + "...", tx_hash.hex()[:16] + "...",
+                )
+                return True, amount, tx_hash.hex()
+            else:
+                logger.error("❌ 资金归集交易失败 (tx: %s)", tx_hash.hex())
+                return False, 0.0, f"交易上链失败: {tx_hash.hex()}"
+
+        except Exception as e:
+            logger.error("资金归集异常: %s", e)
+            return False, 0.0, str(e)
+
     def _get_client(self):
         if self._client:
             return self._client

@@ -220,6 +220,25 @@ class TelegramNotifier:
             f"bot 已暂停下单。"
         )
 
+    def sweep_result(self, success: bool, amount: float, balance: float,
+                     to_wallet: str, tx_or_err: str):
+        short_addr = to_wallet[:6] + "..." + to_wallet[-4:] if len(to_wallet) > 10 else to_wallet
+        if success:
+            return (
+                f"{self._header()}"
+                f"💸 <b>资金归集成功</b>\n"
+                f"转出: <b>${amount:.2f} USDC</b> → <code>{short_addr}</code>\n"
+                f"归集前余额: ${balance:.2f}\n"
+                f"tx: <code>{tx_or_err[:20]}...</code>"
+            )
+        else:
+            return (
+                f"{self._header()}"
+                f"⚠️ <b>资金归集失败</b>\n"
+                f"余额: ${balance:.2f}  目标: <code>{short_addr}</code>\n"
+                f"原因: {tx_or_err}"
+            )
+
     def risk_alert(self, reason: str):
         return (
             f"{self._header()}"

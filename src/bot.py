@@ -560,10 +560,43 @@ class PolymarketBot:
                 )
                 if redeem_result.success:
                     logger.info("✅ 自动兑换成功 tx=%s", str(redeem_result.tx_hash)[:20] + "…")
+                    # 兑换成功后检查是否触发资金归集
+                    if cfg.has_sweep:
+                        await self._maybe_sweep(loop)
                 else:
                     logger.warning("⚠️ 自动兑换失败（已加入待兑换队列）: %s", redeem_result.error)
 
     # ── 辅助方法 ─────────────────────────────────────
+
+    async def _maybe_sweep(self, loop):
+        """兑换成功后检查余额，超过阈值则执行资金归集。"""
+        try:
+            balance = await loop.run_in_executor(
+                None, self.executor.get_wallet_usdc_balance
+            )
+            if balance <= cfg.sweep_threshold:
+                logger.debug(
+                    "归集检查: 余额=$%.2f 未超过阈值=$%.2f，跳过",
+                    balance, cfg.sweep_threshold,
+                )
+                return
+            logger.info(
+                "💸 触发资金归集: 余额=$%.2f 阈值=$%.2f 比例=%.0f%%",
+                balance, cfg.sweep_threshold, cfg.sweep_ratio * 100,
+            )
+            ok, sent, tx = await loop.run_in_executor(
+                None, self.executor.sweep_usdc, balance
+            )
+            notifier.notify(notifier.sweep_result(ok, sent, balance, cfg.sweep_wallet, tx))
+            if ok:
+                # 归集后同步资金基准，避免 Kelly 仓位基于归集前余额计算
+                # 同时更新 _day_start_capital 防止 day_loss 虚高触发熔断
+                post_sweep = balance - sent
+                self.risk.sweep_capital(sent)
+                self.strategy.update_capital(post_sweep)
+                logger.info("归集后资金更新: $%.2f → $%.2f", balance, post_sweep)
+        except Exception as e:
+            logger.warning("资金归集检查异常: %s", e)
 
     async def _on_new_window(
         self, window_ts: int, btc_price: float,
