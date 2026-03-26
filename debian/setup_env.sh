@@ -10,6 +10,12 @@
 #   PYTHON_VERSION=3.12.8   默认 3.12.8
 #   SKIP_APT=1              跳过 apt（已装过编译依赖时）
 #   SKIP_PYENV=1            假定 pyenv 与 Python 已就绪，只做 venv + pip
+#
+# 请用 bash 或 ./ 运行；若误用 sh（常为 dash），下面会重入 bash。
+
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
 
 set -euo pipefail
 
