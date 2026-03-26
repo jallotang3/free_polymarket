@@ -12,10 +12,13 @@
 
 ### 1. 安装依赖
 
+**Python 版本：需要 3.12 及以上**（`polymarket-apis` 自动兑换依赖要求 ≥3.12）。  
+Debian 12 默认 `apt install python3.12` **不可用**；**一键装环境**：运行 [debian/setup_env.sh](debian/setup_env.sh)（说明见 [debian/README.md](debian/README.md)）。手工步骤见 [doc/DEBIAN12_PYTHON312.md](doc/DEBIAN12_PYTHON312.md)。
+
 ```bash
 pip install -r requirements.txt
-# 或使用虚拟环境（推荐）
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# 或使用虚拟环境（推荐，且请用 python3.12 创建）
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 ### 2. 配置环境变量

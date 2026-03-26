@@ -1,3 +1,4 @@
+# 需要 Python >= 3.12（polymarket-apis 官方要求；Debian 12 见 doc/DEBIAN12_PYTHON312.md）
 aiohttp>=3.9.0
 websockets>=12.0
 python-dotenv>=1.0.0
