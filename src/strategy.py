@@ -10,8 +10,16 @@
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
+
+_TZ_BJ = timezone(timedelta(hours=8))
+
+
+def _beijing_date_str() -> str:
+    """当前北京时间日期 YYYY-MM-DD（用于日盈利统计与次日恢复）。"""
+    return datetime.now(_TZ_BJ).strftime("%Y-%m-%d")
 
 from .config import cfg
 from .data_feed import MarketInfo, OrderBook
@@ -571,8 +579,34 @@ class RiskManager:
         self._paused_until: float = 0.0
         self._total_trades = 0
         self._total_wins   = 0
+        # 北京时间自然日：已实现盈亏累计、日盈利目标是否已触发
+        self._bj_date                   = _beijing_date_str()
+        self._daily_realized_pnl        = 0.0
+        self._profit_target_done_today  = False
+
+    def _roll_bj_day_if_needed(self):
+        d = _beijing_date_str()
+        if d != self._bj_date:
+            self._bj_date = d
+            self._daily_realized_pnl = 0.0
+            self._profit_target_done_today = False
+
+    @property
+    def daily_realized_pnl(self) -> float:
+        return self._daily_realized_pnl
+
+    @property
+    def profit_target_done_today(self) -> bool:
+        return self._profit_target_done_today
+
+    def mark_profit_target_done(self):
+        """日盈利达标后调用：暂停下单直至次日北京时间 0 点。"""
+        self._profit_target_done_today = True
 
     def allow_trade(self) -> tuple[bool, str]:
+        self._roll_bj_day_if_needed()
+        if cfg.has_daily_profit_target and self._profit_target_done_today:
+            return False, "日盈利目标已达成，已暂停下单直至次日(北京时间)"
         now = time.time()
         if now < self._paused_until:
             return False, f"连续亏损熔断，剩余暂停 {int(self._paused_until - now)}s"
@@ -594,6 +628,8 @@ class RiskManager:
         self._day_start_capital -= amount_swept
 
     def record_result(self, win: bool, pnl: float):
+        self._roll_bj_day_if_needed()
+        self._daily_realized_pnl += pnl
         self.current_capital += pnl
         self._total_trades   += 1
         if win:

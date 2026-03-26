@@ -111,6 +111,20 @@ class Config:
             and 0 < self.sweep_ratio <= 1.0
         )
 
+    # ── 日盈利目标（北京时间自然日）──
+    # 当日已实现盈亏累计 ≥ 此值（USDC）时：停止下单，并将盈利部分转归集钱包；次日 0 点（北京时间）后自动恢复
+    daily_profit_target_usdc: float = field(
+        default_factory=lambda: float(os.getenv("DAILY_PROFIT_TARGET_USDC", "0"))
+    )
+    # 日盈利归集后钱包至少保留的 USDC（gas / 次日本金）
+    daily_profit_reserve_usdc: float = field(
+        default_factory=lambda: float(os.getenv("DAILY_PROFIT_RESERVE_USDC", "3"))
+    )
+
+    @property
+    def has_daily_profit_target(self) -> bool:
+        return self.daily_profit_target_usdc > 0
+
     # ── 数据采集 ──
     poll_interval_secs: int = 5
     db_path: str            = field(default_factory=lambda: str(_root / "data" / "observations.db"))

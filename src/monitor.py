@@ -220,6 +220,25 @@ class TelegramNotifier:
             f"bot 已暂停下单。"
         )
 
+    def daily_profit_target_hit(
+        self,
+        daily_pnl: float,
+        target: float,
+        swept: float,
+        balance_after: float,
+        tx_or_note: str,
+    ):
+        """日盈利达标：已暂停下单，盈利已尝试归集。"""
+        return (
+            f"{self._header()}"
+            f"🎯 <b>日盈利目标达成</b>\n"
+            f"今日已实现: <b>${daily_pnl:.2f}</b> ≥ 目标 <b>${target:.2f}</b>\n"
+            f"已暂停下单，次日北京时间 0 点后自动恢复。\n"
+            f"归集尝试: <b>${swept:.2f}</b> USDC\n"
+            f"归集后约余: <b>${balance_after:.2f}</b>\n"
+            f"<code>{tx_or_note[:200]}</code>"
+        )
+
     def sweep_result(self, success: bool, amount: float, balance: float,
                      to_wallet: str, tx_or_err: str):
         short_addr = to_wallet[:6] + "..." + to_wallet[-4:] if len(to_wallet) > 10 else to_wallet

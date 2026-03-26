@@ -514,6 +514,7 @@ class PolymarketBot:
             pnl = await self.executor.settle(trade, result)
             win = (result == trade.direction)
             self.risk.record_result(win, pnl)
+            await self._maybe_daily_profit_stop(loop)
             stats = self.risk.stats
             logger.info(
                 "%s 结算 | %s → %s | PnL=%+.2f | 胜率=%.1f%% | 总PnL=%+.2f",
@@ -567,6 +568,66 @@ class PolymarketBot:
                     logger.warning("⚠️ 自动兑换失败（已加入待兑换队列）: %s", redeem_result.error)
 
     # ── 辅助方法 ─────────────────────────────────────
+
+    async def _maybe_daily_profit_stop(self, loop):
+        """
+        当日已实现盈亏（北京时间）≥ DAILY_PROFIT_TARGET_USDC 时：
+          1. 暂停下单直至次日北京时间 0 点
+          2. 将 min(今日累计盈利, 余额−保留) 转至 SWEEP_WALLET（需配置地址）
+        """
+        if not cfg.has_daily_profit_target:
+            return
+        if self.risk.profit_target_done_today:
+            return
+        if self.risk.daily_realized_pnl < cfg.daily_profit_target_usdc:
+            return
+
+        self.risk.mark_profit_target_done()
+        target = cfg.daily_profit_target_usdc
+        daily  = self.risk.daily_realized_pnl
+        reserve = max(0.0, cfg.daily_profit_reserve_usdc)
+
+        balance = 0.0
+        if self.mode == "live":
+            try:
+                balance = await loop.run_in_executor(
+                    None, self.executor.get_wallet_usdc_balance
+                )
+            except Exception as e:
+                logger.warning("日盈利归集：读余额失败 %s", e)
+        else:
+            balance = self.risk.current_capital
+
+        want = min(max(0.0, daily), max(0.0, balance - reserve))
+        want = round(want, 2)
+        tx_note = "未配置 SWEEP_WALLET 或未归集"
+        swept = 0.0
+        post_bal = balance
+
+        if want >= 1.0 and cfg.sweep_wallet and cfg.sweep_wallet.strip():
+            ok, sent, tx_note = await loop.run_in_executor(
+                None, self.executor.sweep_usdc_exact, want
+            )
+            if ok and sent > 0:
+                swept = sent
+                self.risk.sweep_capital(sent)
+                post_bal = balance - sent
+                self.strategy.update_capital(self.risk.current_capital)
+                logger.info(
+                    "🎯 日盈利达标归集: 转出 $%.2f → 归集钱包 | 余额 $%.2f → $%.2f",
+                    sent, balance, post_bal,
+                )
+            else:
+                logger.warning("日盈利达标但归集失败: %s", tx_note)
+        else:
+            if want < 1.0:
+                tx_note = f"可转金额 ${want:.2f} 过小或余额不足保留 ${reserve:.2f}"
+            logger.info("🎯 日盈利达标: 今日PnL=%.2f ≥ %.2f，已暂停下单", daily, target)
+
+        if cfg.has_telegram:
+            notifier.notify(notifier.daily_profit_target_hit(
+                daily, target, swept, post_bal, tx_note,
+            ))
 
     async def _maybe_sweep(self, loop):
         """兑换成功后检查余额，超过阈值则执行资金归集。"""
@@ -744,6 +805,11 @@ def main():
     logger.info("  信号路径: 路径1(跟赔率) | 路径2(赔率强信号) | 路径3(末期套利)")
     logger.info("  贪婪指数: %d/10 | 赔率下限: %.2f | gap下限: %.2f%% | EV下限: %.2f",
                 cfg.greed_index, gp["min_odds_path2"], gp["min_gap"], gp["min_ev"])
+    if cfg.has_daily_profit_target:
+        logger.info(
+            "  日盈利目标: ≥$%.2f USDC 达标则暂停下单并归集盈利 | 钱包保留 ≥$%.2f",
+            cfg.daily_profit_target_usdc, cfg.daily_profit_reserve_usdc,
+        )
     logger.info("=" * 60)
 
     if mode == "live":
