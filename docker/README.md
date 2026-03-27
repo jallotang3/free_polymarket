@@ -26,7 +26,7 @@ docker compose up --build
 ## 覆盖命令（实盘等）
 
 ```bash
-docker compose -f docker/docker-compose.yml run --rm bot python -m src.bot --mode live --capital 100
+docker compose -f docker/docker-compose.yml run --rm bot python -m src.bot --mode live --yes
 ```
 
 后台常驻：
