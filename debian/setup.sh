@@ -61,7 +61,7 @@ if [[ ! -f "$OVERRIDE_FILE" ]]; then
 # 删除此文件后重新运行 setup.sh 可重置为纸面模式
 services:
   bot:
-    command: ["python", "-m", "src.bot", "--mode", "live"]
+    command: ["python", "-m", "src.bot", "--mode", "live","--yes"]
 YAML
 else
     warn "override 已存在，跳过生成：$OVERRIDE_FILE"
