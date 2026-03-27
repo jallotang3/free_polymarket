@@ -1,0 +1,21 @@
+# 用法见同目录 README.md
+# 在仓库根目录：docker compose -f docker/docker-compose.yml up --build
+# 或在 docker/ 下：docker compose up --build
+
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: fuck-polymarket-bot:latest
+    working_dir: /app
+    env_file:
+      - ../.env
+    volumes:
+      - ../data:/app/data
+      - ../logs:/app/logs
+    # 需要让容器访问宿主机上的代理时取消下一行注释（Linux + host.docker.internal）
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    command: ["python", "-m", "src.bot", "--mode", "paper", "--capital", "1000"]
+    restart: unless-stopped

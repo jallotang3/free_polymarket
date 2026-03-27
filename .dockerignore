@@ -1,0 +1,20 @@
+# 构建上下文瘦身与安全（镜像内不需要本地 venv / 密钥）
+.git
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.env
+.env.*
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+btc_1m_7d.json
+# 文档与宿主机脚本不必进镜像
+doc/
+debian/
+docker/
+*.md

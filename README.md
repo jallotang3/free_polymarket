@@ -21,6 +21,8 @@ pip install -r requirements.txt
 python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
+**Docker**：宿主机可不装 Python 3.12，用 Compose 构建并运行，见 [docker/README.md](docker/README.md)。
+
 ### 2. 配置环境变量
 
 ```bash

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Debian（推荐 bookworm 12）一键安装：编译依赖 + pyenv + Python 3.12 + 项目 .venv
-# 原因：稳定源无 python3.12 套件，polymarket-apis 需要 Python >= 3.12
+# Debian（推荐 bookworm 12）一键安装：uv + Python 3.12 + 项目 .venv
+# 原因：稳定源无 python3.12 套件；uv 使用预编译 Python，比 pyenv 源码编译快得多
 #
 # 用法：
 #   chmod +x debian/setup_env.sh
 #   ./debian/setup_env.sh
 #
 # 环境变量（可选）：
-#   PYTHON_VERSION=3.12.8   默认 3.12.8
-#   SKIP_APT=1              跳过 apt（已装过编译依赖时）
-#   SKIP_PYENV=1            假定 pyenv 与 Python 已就绪，只做 venv + pip
+#   PYTHON_VERSION=3.12.8   默认 3.12.8（uv python install）
+#   SKIP_APT=1              跳过 apt（已装过基础工具时）
+#   SKIP_UV=1               跳过安装 uv 可执行文件（需 PATH 中已有 uv）
+#   SKIP_PYENV=1            同 SKIP_UV（兼容旧名）
 #
 # 请用 bash 或 ./ 运行；若误用 sh（常为 dash），下面会重入 bash。
 
@@ -25,11 +26,11 @@ PY_VERSION="${PYTHON_VERSION:-3.12.8}"
 VENV_DIR="${VENV_DIR:-${PROJECT_ROOT}/.venv}"
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
   echo "选项:"
   echo "  -h, --help        显示说明"
-  echo "  --system-only     只执行 apt 安装编译依赖（不装 pyenv / 不建 venv）"
-  echo "  --skip-venv       只装系统依赖 + pyenv + Python，不创建 .venv、不 pip install"
+  echo "  --system-only     只执行 apt 安装基础包（不装 uv / 不建 venv）"
+  echo "  --skip-venv       只装 apt + uv + Python，不创建 .venv、不 pip install"
 }
 
 SYSTEM_ONLY=0
@@ -45,12 +46,11 @@ done
 
 log() { echo "[setup_env] $*"; }
 
-# 常用工具：curl / wget / git（下载脚本、克隆依赖、pyenv 插件等）
+# curl：拉 uv 安装脚本；wget/git：日常与部分工具链
 APT_PACKAGES=(
-  make build-essential ca-certificates
+  ca-certificates
   curl wget git
-  libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev
-  libncursesw5-dev xz-utils tk-dev libffi-dev liblzma-dev
+  build-essential
 )
 
 install_apt() {
@@ -62,7 +62,7 @@ install_apt() {
     log "需要 root 或 sudo 以安装 apt 软件包"
     exit 1
   fi
-  log "安装 apt 编译依赖（Python ${PY_VERSION} 源码编译需要）…"
+  log "安装 apt 基础依赖（网络工具 + build-essential，供 uv 与偶发 pip 源码构建）…"
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
     apt-get update
     apt-get install -y "${APT_PACKAGES[@]}"
@@ -72,71 +72,66 @@ install_apt() {
   fi
 }
 
-ensure_pyenv() {
-  if [[ "${SKIP_PYENV:-0}" == "1" ]]; then
-    log "SKIP_PYENV=1，跳过 pyenv 安装"
-    export PATH="${HOME}/.pyenv/bin:${PATH}"
+prepend_path_local_bin() {
+  export PATH="${HOME}/.local/bin:${PATH}"
+}
+
+ensure_uv() {
+  prepend_path_local_bin
+  if [[ "${SKIP_UV:-0}" == "1" ]] || [[ "${SKIP_PYENV:-0}" == "1" ]]; then
+    log "SKIP_UV=1（或 SKIP_PYENV=1），跳过 uv 安装脚本；请确保 uv 已在 PATH"
+    if ! command -v uv >/dev/null 2>&1; then
+      log "未找到 uv，请先安装: curl -LsSf https://astral.sh/uv/install.sh | sh"
+      exit 1
+    fi
     return 0
   fi
-  export PYENV_ROOT="${PYENV_ROOT:-${HOME}/.pyenv}"
-  if [[ ! -d "${PYENV_ROOT}/bin" ]]; then
-    log "安装 pyenv（官方脚本，目录: ${PYENV_ROOT}）…"
-    curl -fsSL https://pyenv.run | bash
+  if command -v uv >/dev/null 2>&1; then
+    log "已存在 uv: $(command -v uv)"
+  else
+    log "安装 uv（官方脚本，目录: ~/.local/bin）…"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
   fi
-  export PATH="${PYENV_ROOT}/bin:${PATH}"
-  # shellcheck disable=SC1090
-  eval "$(pyenv init - bash)"
+  prepend_path_local_bin
+  if ! command -v uv >/dev/null 2>&1; then
+    log "无法找到 uv，请执行: export PATH=\"\$HOME/.local/bin:\$PATH\""
+    exit 1
+  fi
 
-  # 持久化到 ~/.bashrc（幂等）
-  if ! grep -qF 'pyenv init' "${HOME}/.bashrc" 2>/dev/null; then
+  if ! grep -qF '.local/bin' "${HOME}/.bashrc" 2>/dev/null; then
     {
       echo ''
-      echo '# pyenv (fuck_polymarket debian/setup_env.sh)'
-      echo "export PYENV_ROOT=\"\${PYENV_ROOT:-\$HOME/.pyenv}\""
-      echo 'export PATH="$PYENV_ROOT/bin:$PATH"'
-      echo 'eval "$(pyenv init - bash)"'
+      echo '# uv PATH (fuck_polymarket debian/setup_env.sh)'
+      echo 'export PATH="$HOME/.local/bin:$PATH"'
     } >> "${HOME}/.bashrc"
-    log "已追加 pyenv 初始化到 ~/.bashrc，新开终端或: source ~/.bashrc"
+    log "已追加 ~/.local/bin 到 PATH（~/.bashrc），新开终端或: source ~/.bashrc"
   fi
 }
 
-pyenv_install_python() {
-  export PATH="${PYENV_ROOT:-${HOME}/.pyenv}/bin:${PATH}"
-  # shellcheck disable=SC1090
-  eval "$(pyenv init - bash)"
-
-  if pyenv versions --bare 2>/dev/null | grep -qxF "${PY_VERSION}"; then
-    log "Python ${PY_VERSION} 已安装（pyenv）"
-  else
-    log "编译并安装 Python ${PY_VERSION}（首次可能需数分钟）…"
-    pyenv install "${PY_VERSION}"
+uv_install_python() {
+  prepend_path_local_bin
+  if ! command -v uv >/dev/null 2>&1; then
+    log "缺少 uv"
+    exit 1
   fi
-
-  cd "${PROJECT_ROOT}"
-  pyenv local "${PY_VERSION}"
-  log "已在 ${PROJECT_ROOT} 设置 pyenv local ${PY_VERSION}"
+  log "安装 Python ${PY_VERSION}（uv 预编译发行版，通常数分钟内完成）…"
+  uv python install "${PY_VERSION}"
+  log "Python ${PY_VERSION} 已就绪（由 uv 管理）"
 }
 
 create_venv_and_pip() {
-  export PATH="${PYENV_ROOT:-${HOME}/.pyenv}/bin:${PATH}"
-  # shellcheck disable=SC1090
-  eval "$(pyenv init - bash)"
+  prepend_path_local_bin
   cd "${PROJECT_ROOT}"
-
-  pyenv local "${PY_VERSION}"
-  local py="$(pyenv which python)"
-  log "使用解释器: ${py}"
 
   if [[ -d "${VENV_DIR}" ]]; then
     log "已存在 ${VENV_DIR}，跳过创建（如需重建请手动删除该目录）"
   else
     log "创建虚拟环境: ${VENV_DIR}"
-    "${py}" -m venv "${VENV_DIR}"
+    uv venv --python "${PY_VERSION}" "${VENV_DIR}"
   fi
 
-  log "升级 pip 并安装 requirements.txt"
-  "${VENV_DIR}/bin/pip" install -U pip setuptools wheel
-  "${VENV_DIR}/bin/pip" install -r "${PROJECT_ROOT}/requirements.txt"
+  log "安装 requirements.txt（uv pip）"
+  uv pip install -r "${PROJECT_ROOT}/requirements.txt" --python "${VENV_DIR}/bin/python"
 
   log "完成。"
   echo ""
@@ -148,15 +143,16 @@ create_venv_and_pip() {
 install_apt
 
 if [[ "${SYSTEM_ONLY}" == "1" ]]; then
-  log "仅系统依赖已安装（--system-only）。请自行安装 pyenv 与 Python ${PY_VERSION}。"
+  log "仅系统依赖已安装（--system-only）。请自行安装 uv 并: uv python install ${PY_VERSION}"
   exit 0
 fi
 
-ensure_pyenv
-pyenv_install_python
+ensure_uv
+uv_install_python
 
 if [[ "${SKIP_VENV}" == "1" ]]; then
-  log "已跳过 venv（--skip-venv）。在项目目录执行: python -m venv .venv && .venv/bin/pip install -r requirements.txt"
+  log "已跳过 venv（--skip-venv）。在项目目录执行:"
+  log "  uv venv --python ${PY_VERSION} .venv && uv pip install -r requirements.txt --python .venv/bin/python"
   exit 0
 fi
 

@@ -11,7 +11,17 @@ VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
 
 if [ ! -f "$VENV_PYTHON" ]; then
     echo "❌ 虚拟环境未找到: $VENV_PYTHON"
-    echo "   请先运行: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+    echo "   polymarket-apis 需要 Python ≥3.12，请用 3.12 创建 venv，例如:"
+    echo "   python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+    echo "   无系统 3.12 时见: doc/DEBIAN12_PYTHON312.md 或 docker/README.md"
+    exit 1
+fi
+
+if ! "$VENV_PYTHON" -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 12) else 1)'; then
+    ver="$("$VENV_PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    echo "❌ 需要 Python ≥3.12，当前 .venv 为 Python ${ver}"
+    echo "   请删除 .venv 后用 3.12 重建: rm -rf .venv && python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+    echo "   说明: doc/DEBIAN12_PYTHON312.md"
     exit 1
 fi
 
