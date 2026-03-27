@@ -611,9 +611,11 @@ class RiskManager:
         if now < self._paused_until:
             return False, f"连续亏损熔断，剩余暂停 {int(self._paused_until - now)}s"
         self._refresh_day()
-        day_loss = (self._day_start_capital - self.current_capital) / self._day_start_capital
-        if day_loss >= cfg.max_daily_loss_fraction:
-            return False, f"日亏损 {day_loss:.1%} 已达上限"
+        # _day_start_capital 过小（归集后余额极低）时跳过日亏损检查，避免分母接近0导致比例爆炸
+        if self._day_start_capital >= 1.0:
+            day_loss = (self._day_start_capital - self.current_capital) / self._day_start_capital
+            if day_loss >= cfg.max_daily_loss_fraction:
+                return False, f"日亏损 {day_loss:.1%} 已达上限"
         if self.current_capital < self.initial_capital * 0.10:
             return False, "资金不足初始的 10%"
         return True, "ok"
@@ -623,9 +625,10 @@ class RiskManager:
         资金归集后同步资金基准。
         同时更新 current_capital 和 _day_start_capital，
         避免归集导致 day_loss 虚高触发熔断。
+        _day_start_capital 最低保留 1.0，防止分母接近 0 导致日亏损比例爆炸。
         """
         self.current_capital    -= amount_swept
-        self._day_start_capital -= amount_swept
+        self._day_start_capital  = max(self._day_start_capital - amount_swept, 1.0)
 
     def record_result(self, win: bool, pnl: float):
         self._roll_bj_day_if_needed()
