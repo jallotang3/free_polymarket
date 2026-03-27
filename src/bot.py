@@ -518,7 +518,6 @@ class PolymarketBot:
             pnl = await self.executor.settle(trade, result)
             win = (result == trade.direction)
             self.risk.record_result(win, pnl)
-            await self._maybe_daily_profit_stop(loop)
             stats = self.risk.stats
             logger.info(
                 "%s 结算 | %s → %s | PnL=%+.2f | 胜率=%.1f%% | 总PnL=%+.2f",
@@ -565,7 +564,8 @@ class PolymarketBot:
                 )
                 if redeem_result.success:
                     logger.info("✅ 自动兑换成功 tx=%s", str(redeem_result.tx_hash)[:20] + "…")
-                    # 兑换成功后检查是否触发资金归集
+                    # 兑换成功后：先检查日盈利目标，再检查余额归集
+                    await self._maybe_daily_profit_stop(loop)
                     if cfg.has_sweep:
                         await self._maybe_sweep(loop)
                 else:
