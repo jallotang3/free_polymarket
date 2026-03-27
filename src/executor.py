@@ -493,11 +493,12 @@ class LiveExecutor:
         except Exception as e:
             logger.warning("allowance 检查/授权异常（不影响下单，若持续报错请手动 approve）: %s", e)
 
-    async def place(self, signal: Signal, window_ts: int) -> Optional[TradeRecord]:
+    async def place(self, signal: Signal, window_ts: int) -> "tuple[Optional[TradeRecord], str]":
+        """返回 (trade, error_msg)；成功时 error_msg 为空字符串。"""
         loop = asyncio.get_event_loop()
         try:
             result = await loop.run_in_executor(None, self._do_place, signal, window_ts)
-            return result
+            return result, ""
         except Exception as e:
             err = str(e)
             # 区分网络错误 vs API 拒绝，方便排查
@@ -505,7 +506,7 @@ class LiveExecutor:
                 logger.error("下单失败（网络错误，已重试%d次）: %s", 3, err)
             else:
                 logger.error("下单失败: %s", e)
-            return None
+            return None, err
 
     def _do_place(self, signal: Signal, window_ts: int) -> Optional[TradeRecord]:
         from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions

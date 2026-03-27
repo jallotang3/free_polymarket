@@ -376,9 +376,13 @@ class PolymarketBot:
                     signal.bet_amount = min(signal.bet_amount, cfg.max_bet_usdc)
 
         # ── 14. 执行下单 ──
-        trade = await self.executor.place(signal, window_ts)
+        trade, place_err = await self.executor.place(signal, window_ts)
         if trade is None:
             logger.error("下单失败")
+            notifier.notify(notifier.place_failed(
+                signal.direction.value, signal.bet_amount,
+                signal.market_price, place_err,
+            ))
             return
 
         self._open_trades[window_ts] = trade

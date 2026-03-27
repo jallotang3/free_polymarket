@@ -161,6 +161,14 @@ class TelegramNotifier:
 
     # ── 格式化消息模板 ──
 
+    def place_failed(self, direction: str, amount: float, entry_price: float, error: str):
+        return (
+            f"{self._header()}"
+            f"❌ <b>下单失败</b>\n"
+            f"方向: <b>{direction}</b>  金额: <b>${amount:.2f}</b>  入场价: {entry_price:.3f}\n"
+            f"<code>{error[:400]}</code>"
+        )
+
     def trade_opened(self, mode: str, direction: str, amount: float,
                      entry_price: float, ev: float, gap: float,
                      capital: float = 0.0, wallet_usdc: float = 0.0):
