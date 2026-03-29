@@ -34,6 +34,7 @@ from src.data_feed import (
     current_window_ts, seconds_into_window, seconds_remaining,
     get_market_info, get_clob_midpoints, get_orderbook,
     get_chainlink_onchain_price, get_btc_price_rest, get_cryptocompare_price,
+    get_polymarket_ui_open_price,
 )
 from src.strategy import Direction, LateStageArbitrageStrategy, RiskManager
 from src.executor import TradeDB, TradeRecord, make_executor
@@ -108,6 +109,9 @@ class PolymarketBot:
         self._last_clob_up: Optional[float] = None
         self._last_clob_dn: Optional[float] = None
 
+        # Polymarket 页面 PtB 晚到时的后台补拉（覆盖 CL/CC/BN 回退）
+        self._ui_ptb_task: Optional[asyncio.Task] = None
+
     # ── 生命周期 ──────────────────────────────────────
 
     async def start(self):
@@ -130,6 +134,8 @@ class PolymarketBot:
 
     def stop(self, reason: str = "手动停止"):
         self._running = False
+        if self._ui_ptb_task and not self._ui_ptb_task.done():
+            self._ui_ptb_task.cancel()
         self.price_feed.stop()
         stats     = self.risk.stats
         total_pnl = stats["pnl"]
@@ -525,6 +531,14 @@ class PolymarketBot:
                 trade.direction, result, pnl,
                 self.risk.win_rate * 100, stats["pnl"],
             )
+            # 此时 Gamma 通常已写入 eventMetadata（盘中拿不到 priceToBeat）
+            if market.price_to_beat is not None or market.final_price is not None:
+                logger.info(
+                    "Gamma 事后锚价 ts=%d | priceToBeat=%s | finalPrice=%s",
+                    wts,
+                    f"{market.price_to_beat:.2f}" if market.price_to_beat is not None else "—",
+                    f"{market.final_price:.2f}" if market.final_price is not None else "—",
+                )
 
             # 结算后立即检查是否触发风控阈值，若是则推送专项告警
             allowed_after, risk_reason = self.risk.allow_trade()
@@ -663,19 +677,47 @@ class PolymarketBot:
         except Exception as e:
             logger.warning("资金归集检查异常: %s", e)
 
+    async def _poll_polymarket_ui_ptb(self, window_ts: int) -> None:
+        """窗口切后前端脱水数据可能晚几秒就绪，轮询成功后以页面价覆盖回退 PtB。"""
+        loop = asyncio.get_event_loop()
+        for _ in range(25):
+            await asyncio.sleep(2.0)
+            if not self._running or self._last_window_ts != window_ts:
+                return
+            p = await loop.run_in_executor(None, get_polymarket_ui_open_price, window_ts)
+            if p is not None and p > 0:
+                self.strategy.set_price_to_beat(window_ts, p, from_polymarket_ui=True)
+                return
+
     async def _on_new_window(
         self, window_ts: int, btc_price: float,
         cc_price: Optional[float], cl_price: Optional[float],
         cl_fresh: bool, elapsed: int,
     ):
-        """窗口开盘初始化：记录 PtB（优先 Chainlink链上 > CC > BN）"""
+        """窗口开盘初始化：记录 PtB（优先 Polymarket 页面脱水价 > Chainlink链上 > CC > BN）"""
+        if self._ui_ptb_task and not self._ui_ptb_task.done():
+            self._ui_ptb_task.cancel()
+        self._ui_ptb_task = None
+
         self._bn_ptb_cache[window_ts] = btc_price
         self._cc_ptb_cache[window_ts] = cc_price or btc_price
         if cl_price and cl_fresh:
             self._cl_ptb_cache[window_ts] = cl_price
         self._ptb_delay_cache[window_ts] = elapsed
 
-        if cl_price and cl_fresh:
+        loop = asyncio.get_event_loop()
+        ui_ptb: Optional[float] = None
+        if cfg.polymarket_ui_ptb:
+            for attempt in range(5):
+                ui_ptb = await loop.run_in_executor(None, get_polymarket_ui_open_price, window_ts)
+                if ui_ptb is not None and ui_ptb > 0:
+                    break
+                if attempt < 4:
+                    await asyncio.sleep(1.5)
+
+        if ui_ptb is not None and ui_ptb > 0:
+            ptb, ptb_src = ui_ptb, f"Polymarket页面PtB=${ui_ptb:,.2f}"
+        elif cl_price and cl_fresh:
             ptb, ptb_src = cl_price, f"CL链上PtB=${cl_price:,.2f}"
         elif cc_price:
             ptb, ptb_src = cc_price, f"CC估算PtB=${cc_price:,.2f}"
@@ -688,7 +730,15 @@ class PolymarketBot:
         logger.info("── 新窗口 ts=%d  %s  [%s]  资金=$%.2f ──",
                     window_ts, ptb_src, quality, self.risk.current_capital)
 
-        self.strategy.set_price_to_beat(window_ts, ptb)
+        if ui_ptb is not None and ui_ptb > 0:
+            self.strategy.set_price_to_beat(window_ts, ui_ptb, from_polymarket_ui=True)
+        else:
+            self.strategy.set_price_to_beat(window_ts, ptb)
+            if cfg.polymarket_ui_ptb:
+                self._ui_ptb_task = asyncio.create_task(
+                    self._poll_polymarket_ui_ptb(window_ts),
+                    name=f"ui_ptb_{window_ts}",
+                )
 
         # 历史背景预取（异步，不阻塞主循环）
         if self.mc is not None:

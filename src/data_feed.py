@@ -1,10 +1,14 @@
 """
 数据源模块
 
-数据源优先级（与 scripts/collect_data.py 保持一致）：
-  1. Chainlink 链上标准聚合器 (Polygon PoS)  — 最接近真实 PtB
-  2. CryptoCompare 多交易所均价             — 偏差通常 < $10
-  3. Binance 现货价格                        — 最快，但有系统性偏差
+盘中 gap 锚价（无法从 Gamma 实时拿到官方 PtB，见下）：
+  1. Polymarket 站点 Next.js 脱水 JSON（crypto-prices 查询）— 与页面展示的 Chainlink 窗口一致，优先使用
+  2. Chainlink 链上 BTC/USD 聚合器 (Polygon) — 与 Polymarket 使用的 Data Streams 不同源，但是免费数据中最接近的一类
+  3. CryptoCompare 加权 USD / Binance — 作 BN/CC 通道的回退快照
+
+Gamma API 说明：
+  eventMetadata.priceToBeat / finalPrice 在多数情况下仅在**市场关闭、结算写入后**才出现在接口响应中，
+  因此**不能**依赖其在盘中作为开盘价；解析后仅用于事后校验、日志或分析。
 
 赔率来源：
   CLOB 实时订单簿 midpoint（< 1s 延迟）> Gamma API outcomePrices（仅作备用，最高滞后 0.30+）
@@ -14,6 +18,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -24,6 +29,7 @@ logger = logging.getLogger("data_feed")
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
+POLYMARKET_ORIGIN = "https://polymarket.com"
 
 # ── Chainlink BTC/USD 链上聚合器（Polygon PoS） ──
 # 更新规则：价格偏差 ≥ 0.5% 或心跳 3600s，实测 BTC 波动时约 15-60s 更新一次
@@ -90,6 +96,24 @@ class BtcTick:
     ts: int
 
 
+def _parse_event_metadata(ev: dict) -> tuple[Optional[float], Optional[float]]:
+    """解析 Gamma 事件级 eventMetadata。字段多在结算后才有，盘中常为缺省。"""
+    meta = ev.get("eventMetadata")
+    if not meta or not isinstance(meta, dict):
+        return None, None
+
+    def _to_float(k: str) -> Optional[float]:
+        v = meta.get(k)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    return _to_float("priceToBeat"), _to_float("finalPrice")
+
+
 @dataclass
 class MarketInfo:
     """窗口静态信息（每窗口从 Gamma API 获取一次）"""
@@ -104,6 +128,10 @@ class MarketInfo:
     active:       bool
     closed:       bool
     fetched_at:   int = field(default_factory=lambda: int(time.time()))
+    # 结算后 API 常带 eventMetadata（盘中多为 None）；不作实时 gap 锚价
+    price_to_beat: Optional[float] = None
+    final_price:   Optional[float] = None
+    neg_risk:      bool = False
 
     # 由 bot 每 poll 更新的实时 CLOB 赔率（初始等于 gamma 值）
     up_odds:  float = 0.5
@@ -191,8 +219,8 @@ def get_chainlink_onchain_price() -> tuple[Optional[float], Optional[int]]:
 def get_market_info(window_ts: int) -> Optional[MarketInfo]:
     """
     从 Gamma API 获取窗口静态信息（token_id, condition_id 等）。
-    每窗口只调用一次；outcomePrices 仅作初始赔率备用。
-    实时赔率请调用 get_clob_midpoints()。
+    outcomePrices 仅作初始赔率备用；实时赔率请用 get_clob_midpoints()。
+    price_to_beat / final_price 来自 eventMetadata，通常仅在**收盘后**才有，勿用于盘中锚定。
     """
     slug = f"btc-updown-5m-{window_ts}"
     data = _get(f"{GAMMA_API}/events?slug={slug}")
@@ -205,6 +233,7 @@ def get_market_info(window_ts: int) -> Optional[MarketInfo]:
         prices = json.loads(m["outcomePrices"])
         gamma_up = float(prices[0])
         gamma_dn = float(prices[1])
+        ptb, fin = _parse_event_metadata(ev)
         info = MarketInfo(
             window_ts    = window_ts,
             condition_id = m["conditionId"],
@@ -217,10 +246,14 @@ def get_market_info(window_ts: int) -> Optional[MarketInfo]:
             volume       = float(m.get("volume", 0)),
             active       = bool(m.get("active", False)),
             closed       = bool(m.get("closed", False)),
+            price_to_beat= ptb,
+            final_price  = fin,
+            neg_risk     = bool(m.get("negRisk", False)),
         )
         logger.debug(
-            "Gamma 静态信息 ts=%d | gamma_up=%.3f gamma_dn=%.3f vol=$%.0f",
+            "Gamma 静态信息 ts=%d | gamma_up=%.3f gamma_dn=%.3f vol=$%.0f ptb=%s",
             window_ts, gamma_up, gamma_dn, info.volume,
+            f"{ptb:.2f}" if ptb is not None else "—",
         )
         return info
     except (KeyError, IndexError, json.JSONDecodeError, ValueError) as e:
@@ -256,6 +289,169 @@ def get_orderbook(token_id: str) -> Optional[OrderBook]:
     except (KeyError, ValueError) as e:
         logger.debug("订单簿解析失败: %s", e)
         return None
+
+
+# ─────────────────────────────────────────────
+# Polymarket 网页脱水数据（当前窗口开盘价）
+# ─────────────────────────────────────────────
+
+def _iso_utc_z(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iso_z_to_ts(s: str) -> Optional[int]:
+    """将 queryKey 内 ISO 时间（含 ...Z 或 ...000Z）转为 Unix 秒，便于与 window_ts 比较。"""
+    if not isinstance(s, str) or not s.strip():
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
+def _fetch_text(url: str, timeout: float = 22.0) -> Optional[str]:
+    try:
+        resp = get_session().get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
+    except requests.exceptions.RequestException as e:
+        logger.debug("GET text 失败 %s → %s", url[:100], e)
+        return None
+
+
+def _get_json_timeout(url: str, timeout: float = 16.0) -> Optional[dict | list]:
+    try:
+        resp = get_session().get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.Timeout:
+        logger.debug("超时: %s", url[:80])
+    except requests.exceptions.RequestException as e:
+        logger.debug("HTTP 错误 %s → %s", url[:80], e)
+    except Exception as e:
+        logger.debug("GET JSON 异常 %s → %s", url[:80], e)
+    return None
+
+
+def _parse_build_id_from_event_html(html: str) -> Optional[str]:
+    """从事件页 __NEXT_DATA__ 解析 Next.js buildId。"""
+    marker = 'id="__NEXT_DATA__"'
+    start = html.find(marker)
+    if start == -1:
+        return None
+    t0 = html.find(">", start)
+    if t0 == -1:
+        return None
+    t0 += 1
+    t1 = html.find("</script>", t0)
+    if t1 == -1:
+        return None
+    try:
+        j = json.loads(html[t0:t1])
+        bid = j.get("buildId")
+        if isinstance(bid, str):
+            return bid
+    except json.JSONDecodeError as e:
+        logger.debug("__NEXT_DATA__ JSON 解析失败: %s", e)
+    return None
+
+
+def _extract_ui_open_price_from_page(page: dict, window_ts: int) -> Optional[float]:
+    """
+    在 dehydratedState.queries 中查找 queryKey
+    ['crypto-prices','price','BTC',<start>,<fiveminute>,<end>] 的 openPrice；
+    若无精确匹配，则回退到 closePrice 为 null 的当前根 K 线。
+    """
+    wt0, wt1 = window_ts, window_ts + 300
+    try:
+        queries = page["pageProps"]["dehydratedState"]["queries"]
+    except (KeyError, TypeError):
+        return None
+    for q in queries:
+        qk = q.get("queryKey")
+        if not isinstance(qk, list) or len(qk) < 6:
+            continue
+        if qk[0] != "crypto-prices" or qk[1] != "price" or qk[2] != "BTC":
+            continue
+        if qk[4] != "fiveminute":
+            continue
+        ts_a = _iso_z_to_ts(qk[3])
+        ts_b = _iso_z_to_ts(qk[5])
+        if ts_a != wt0 or ts_b != wt1:
+            continue
+        st = q.get("state") or {}
+        data = st.get("data")
+        if not isinstance(data, dict):
+            return None
+        op = data.get("openPrice")
+        if op is None:
+            return None
+        try:
+            p = float(op)
+            return p if p > 0 else None
+        except (TypeError, ValueError):
+            return None
+    for q in queries:
+        qk = q.get("queryKey")
+        if not isinstance(qk, list) or len(qk) < 6:
+            continue
+        if qk[0] != "crypto-prices" or qk[1] != "price" or qk[2] != "BTC":
+            continue
+        if qk[4] != "fiveminute":
+            continue
+        st = q.get("state") or {}
+        data = st.get("data")
+        if not isinstance(data, dict):
+            continue
+        if data.get("closePrice") is not None:
+            continue
+        op = data.get("openPrice")
+        if op is None:
+            continue
+        try:
+            p = float(op)
+            if p > 0:
+                return p
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def get_polymarket_ui_open_price(window_ts: int) -> Optional[float]:
+    """
+    从 polymarket.com 事件页对应的 _next/data JSON 读取当前 5m 窗口 BTC 开盘价
+   （与前端 crypto-prices 脱水查询一致）。失败返回 None，由调用方回退到 CL/CC/BN。
+
+    依赖未公开页面结构，若站点改版可能失效。
+    """
+    slug = f"btc-updown-5m-{window_ts}"
+    html = _fetch_text(f"{POLYMARKET_ORIGIN}/event/{slug}")
+    if not html:
+        return None
+    build_id = _parse_build_id_from_event_html(html)
+    if not build_id:
+        logger.debug("未解析到 buildId: %s", slug)
+        return None
+    for loc in ("en", "zh"):
+        url = (
+            f"{POLYMARKET_ORIGIN}/_next/data/{build_id}/{loc}/event/{slug}.json"
+            f"?slug={slug}"
+        )
+        page = _get_json_timeout(url)
+        if not isinstance(page, dict):
+            continue
+        price = _extract_ui_open_price_from_page(page, window_ts)
+        if price is not None:
+            logger.debug("Polymarket 页面开盘价 ts=%d → $%.2f（locale=%s）", window_ts, price, loc)
+            return price
+    logger.debug("Polymarket 页面开盘价不可用 ts=%d", window_ts)
+    return None
 
 
 # ─────────────────────────────────────────────

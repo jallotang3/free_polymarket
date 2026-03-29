@@ -19,6 +19,14 @@ if _env_path.exists():
                 os.environ.setdefault(k.strip(), v)
 
 
+def _env_bool_default_true(name: str) -> bool:
+    """未设置时 True；0/false/no/off 为 False。"""
+    v = os.getenv(name)
+    if v is None:
+        return True
+    return v.strip().lower() not in ("0", "false", "no", "off")
+
+
 @dataclass(frozen=True)
 class Config:
     # ── 区块链 / Polymarket ──
@@ -38,6 +46,10 @@ class Config:
 
     # ── 运行模式 ──
     mode: str             = field(default_factory=lambda: os.getenv("MODE", "paper"))
+
+    # ── 锚价数据源 ──
+    # 是否从 polymarket.com 页面脱水 JSON 拉取当前窗口开盘价（优先于 CL/CC/BN）；默认开启，设为 0 可关闭
+    polymarket_ui_ptb: bool = field(default_factory=lambda: _env_bool_default_true("POLYMARKET_UI_PTB"))
 
     # ── 贪婪指数（1~10，控制冒险程度）──
     # 数据依据：852窗口真实结算数据回测

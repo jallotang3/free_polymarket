@@ -103,8 +103,40 @@ class LateStageArbitrageStrategy:
                 del self._window_states[k]
         return self._window_states[window_ts]
 
-    def set_price_to_beat(self, window_ts: int, price: float):
+    def set_price_to_beat(
+        self,
+        window_ts: int,
+        price: float,
+        *,
+        from_gamma: bool = False,
+        from_polymarket_ui: bool = False,
+    ):
+        """
+        盘中 PtB 优先来自 Polymarket 页面脱水 openPrice，失败则回退首 tick（CL/CC/BN）；
+        Gamma 的 priceToBeat 多在结算后才返回。
+
+        from_gamma=True：事后用 Gamma 官方价覆盖（例如收盘后校验）；一般不应在盘中调用。
+        from_polymarket_ui=True：页面价（可覆盖先前 CL/CC/BN 回退值）。
+        否则：仅当尚未设置 PtB 时写入（回退路径）。
+        """
         state = self.get_window_state(window_ts)
+        if from_gamma:
+            state.price_to_beat = price
+            logger.info("窗口 %d 开盘价（PtB）= $%.2f [Gamma 结算后]", window_ts, price)
+            return
+        if from_polymarket_ui:
+            prev = state.price_to_beat
+            state.price_to_beat = price
+            if prev is not None and abs(prev - price) > 1e-2:
+                logger.info(
+                    "窗口 %d PtB 由 Polymarket 页面修正: $%.2f → $%.2f",
+                    window_ts,
+                    prev,
+                    price,
+                )
+            else:
+                logger.info("窗口 %d 开盘价（PtB）= $%.2f [Polymarket页面]", window_ts, price)
+            return
         if state.price_to_beat is None:
             state.price_to_beat = price
             logger.info("窗口 %d 开盘价（PtB）= $%.2f", window_ts, price)
