@@ -677,6 +677,17 @@ class PolymarketBot:
         except Exception as e:
             logger.warning("资金归集检查异常: %s", e)
 
+    def _sync_gap_caches_to_anchor(self, window_ts: int, ref: float) -> None:
+        """
+        将 Polymarket 共识锚价写入 CL/CC/BN 的 PtB 缓存。
+
+        策略在 evaluate() 里若 CL 新鲜会优先用 cl_gap（由 _cl_ptb_cache 推导），
+        仅改 strategy.price_to_beat 不会更新该 gap；此处与页面锚价对齐。
+        """
+        self._cl_ptb_cache[window_ts] = ref
+        self._cc_ptb_cache[window_ts] = ref
+        self._bn_ptb_cache[window_ts] = ref
+
     async def _poll_polymarket_ui_ptb(self, window_ts: int) -> None:
         """窗口切后前端脱水数据可能晚几秒就绪，轮询成功后以页面价覆盖回退 PtB。"""
         loop = asyncio.get_event_loop()
@@ -686,6 +697,7 @@ class PolymarketBot:
                 return
             p = await loop.run_in_executor(None, get_polymarket_ui_open_price, window_ts)
             if p is not None and p > 0:
+                self._sync_gap_caches_to_anchor(window_ts, p)
                 self.strategy.set_price_to_beat(window_ts, p, from_polymarket_ui=True)
                 return
 
@@ -731,6 +743,7 @@ class PolymarketBot:
                     window_ts, ptb_src, quality, self.risk.current_capital)
 
         if ui_ptb is not None and ui_ptb > 0:
+            self._sync_gap_caches_to_anchor(window_ts, ui_ptb)
             self.strategy.set_price_to_beat(window_ts, ui_ptb, from_polymarket_ui=True)
         else:
             self.strategy.set_price_to_beat(window_ts, ptb)
